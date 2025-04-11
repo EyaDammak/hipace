@@ -738,6 +738,44 @@ LaserIonization (const int islice,
 
 void
 PlasmaParticleContainer::
+InjectionCondition (const MultiLaser& laser, const int islice)
+{
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE( !m_can_laser_injection || laser.UseLaser(),
+    "Error: LaserIonization requires the laser to be enabled in the current slice.");
+    if (!m_can_laser_injection || !laser.UseLaser(islice)) return;
+    HIPACE_PROFILE("PlasmaParticleContainer::InjectionCondition()");
+
+    using namespace amrex::literals;
+    const PhysConst phys_const = get_phys_const();
+    const amrex::Real clight_inv = 1.0_rt/phys_const.c;
+
+    for (PlasmaParticleIterator pti(*this); pti.isValid(); ++pti)
+    {
+        const auto ptd_plasma = pti.GetParticleTile().getParticleTileData();
+
+        amrex::Long const num_particles = pti.numParticles();
+
+        //amrex::Real const max_qsa_weighting_factor = m_max_qsa_weighting_factor;
+
+        // This kernel marks the plasma particles that has been injected in the wake
+        amrex::ParallelFor(num_particles,
+            [=] AMREX_GPU_DEVICE (int ip) {
+                amrex::Real ux = ptd_plasma.rdata(PlasmaIdx::ux)[ip]*clight_inv;
+                amrex::Real uy = ptd_plasma.rdata(PlasmaIdx::uy)[ip]*clight_inv;
+                amrex::Real psi = ptd_plasma.rdata(PlasmaIdx::psi)[ip];
+                amrex::Real gamma_psi = 0.5_rt * ( (1+ ux*ux + uy*uy)/(psi*psi) + 1); // gamma/(1+psi)
+                amrex::Real gamma_psi_condition = 20._rt;
+                amrex::Real condition = gamma_psi - gamma_psi_condition; // condition for injection
+
+                if (condition > 0 && ptd_plasma.id(ip).is_valid()){
+                    ptd_plasma.id(ip) = 3; // set the injected electron ID to 3
+                }
+        });
+    }
+}
+
+void
+PlasmaParticleContainer::
 PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm, const int islice)
 {
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE( !m_can_laser_injection || laser.UseLaser(),
@@ -746,6 +784,10 @@ PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm,
     HIPACE_PROFILE("PlasmaParticleContainer::PlasmaToBeam()");
 
     uint32_t num_new_beam_part = 0;
+
+    using namespace amrex::literals;
+    const PhysConst phys_const = get_phys_const();
+    const amrex::Real clight_inv = 1.0_rt/phys_const.c;
 
     // Loop over plasma particle boxes
     for (PlasmaParticleIterator pti(*this); pti.isValid(); ++pti)
@@ -764,7 +806,7 @@ PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm,
             num_particles, reduce_data,
             [=] AMREX_GPU_DEVICE (int ip) -> ReduceTuple
             {
-                if (ptd_plasma.id(ip) == 2) // whether the plasma particle is from ionization
+                if (ptd_plasma.id(ip) == 3) // whether the plasma particle is from ionization
                 {
                     return {1};
                 } else {
@@ -791,7 +833,8 @@ PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm,
         auto old_size = beam_elec->getNumParticlesIncludingSlipped(WhichBeamSlice::This);
         auto new_size = old_size + num_new_beam_part;
         beam_elec->resize(WhichBeamSlice::This, old_size_non_slip, new_size - old_size_non_slip);
-        beam_elec->updateSize(beam_elec->getTotalNumParticles() + new_size);
+        //beam_elec->updateSize(beam_elec->getTotalNumParticles() + new_size);
+        std::cout << "total particles: " << beam_elec->getTotalNumParticles() << std::endl;
 
         auto ptd_beam = beam_elec->getBeamSlice(WhichBeamSlice::This).getParticleTileData();
 
@@ -799,7 +842,6 @@ PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm,
         const amrex::Real z_lo = gm[0].ProbLo()[2];
         const amrex::Real dt = Hipace::GetInstance().m_dt;
 
-        const PhysConst phys_const = get_phys_const();
         amrex::Gpu::DeviceScalar<uint32_t> ip_beam(0);
         uint32_t * AMREX_RESTRICT p_ip_beam = ip_beam.dataPtr();
 
@@ -807,7 +849,7 @@ PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm,
         // to the beam container and make them invalid in the plasma container
         amrex::ParallelFor(num_particles,
             [=] AMREX_GPU_DEVICE (int ip) {
-                if (ptd_plasma.id(ip) == 2){
+                if (ptd_plasma.id(ip) == 3){
                     const long pid_beam = amrex::Gpu::Atomic::Add(p_ip_beam, 1u);
                     const long pidx_beam = pid_beam + old_size;
                     ptd_beam.id(pidx_beam).make_valid(); // ensure id is valid
@@ -816,13 +858,13 @@ PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm,
                     ptd_beam.pos(2, pidx_beam) = z_lo + dz * islice;
                     ptd_beam.rdata(BeamIdx::ux)[pidx_beam] = ptd_plasma.rdata(PlasmaIdx::ux)[ip];
                     ptd_beam.rdata(BeamIdx::uy)[pidx_beam] = ptd_plasma.rdata(PlasmaIdx::uy)[ip];
-                    amrex::Real ux = ptd_plasma.rdata(PlasmaIdx::ux)[ip]/phys_const.c;
-                    amrex::Real uy = ptd_plasma.rdata(PlasmaIdx::uy)[ip]/phys_const.c;
+                    amrex::Real ux = ptd_plasma.rdata(PlasmaIdx::ux)[ip]*clight_inv;
+                    amrex::Real uy = ptd_plasma.rdata(PlasmaIdx::uy)[ip]*clight_inv;
                     amrex::Real psi = ptd_plasma.rdata(PlasmaIdx::psi)[ip];
                     ptd_beam.rdata(BeamIdx::uz)[pidx_beam] = (1+ux*ux+uy*uy-psi*psi)/(2.*psi)*phys_const.c;
-                    amrex::Real uz = ptd_beam.rdata(BeamIdx::uz)[pidx_beam]/phys_const.c;
-                    const amrex::Real gaminv = 1./std::sqrt(1. + ux*ux + uy*uy + uz*uz);
-                    ptd_beam.rdata(BeamIdx::w)[pidx_beam] = ptd_plasma.rdata(PlasmaIdx::w)[ip] / (psi * gaminv) * dt;
+                    amrex::Real uz = ptd_beam.rdata(BeamIdx::uz)[pidx_beam] * clight_inv;
+                    const amrex::Real gam = std::sqrt(1. + ux*ux + uy*uy + uz*uz);
+                    ptd_beam.rdata(BeamIdx::w)[pidx_beam] = ptd_plasma.rdata(PlasmaIdx::w)[ip] * gam / (psi) * dt;
                     // the coefficient dt is due to the change from the quasi-static plasma frame (x, y, ζ)
                     // to the beam frame (x, y, t).
                     ptd_beam.idata(BeamIdx::nsubcycles)[pidx_beam] = 0;
