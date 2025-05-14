@@ -190,7 +190,6 @@ public:
      */
     bool UseLaser (const int islice) const { return m_use_laser && HasSlice(islice); }
 
-private:
 
     bool m_use_laser {false}; /**< whether a laser is used or not */
     /** Laser central wavelength defined by user.

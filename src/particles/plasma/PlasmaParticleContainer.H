@@ -32,6 +32,7 @@ struct PlasmaIdx
         ux_half_step,       // momentum half a step behind the current slice for leapfrog pusher
         uy_half_step,       // at the same step for AB5 pusher
         psi_half_step,      // never effected by temp slice
+        phi_ion,
 #ifdef HIPACE_USE_AB5_PUSH
         Fx1, Fx2, Fx3, Fx4, Fx5,             // AB5 force terms
         Fy1, Fy2, Fy3, Fy4, Fy5,             //
@@ -239,6 +240,7 @@ public:
     bool m_can_laser_injection = false; /**< whether laser injection is enabled */
     amrex::Real m_uz_threshold = 1.;
     amrex::Real m_injection_weight_factor = 1.;
+    amrex::Real m_beta_p = 1.;
     std::string m_product_beam_name = ""; /**< name of Injection product beam */
     BeamParticleContainer* m_product_beam_pc = nullptr; /**< Injection product beam */
 

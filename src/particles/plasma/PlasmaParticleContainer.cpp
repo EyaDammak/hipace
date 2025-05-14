@@ -77,6 +77,7 @@ PlasmaParticleContainer::ReadParameters ()
     queryWithParser(pp, "can_laser_injection", m_can_laser_injection);
     queryWithParser(pp, "uz_threshold", m_uz_threshold);
     queryWithParser(pp, "injection_weight_factor", m_injection_weight_factor);
+    queryWithParser(pp, "beta_p", m_beta_p);
 
     m_can_ionize = m_can_field_ionize || m_can_laser_ionize;
 
@@ -715,6 +716,7 @@ LaserIonization (const int islice,
                 arrdata_elec[PlasmaIdx::w      ][pidx] = arrdata_ion[PlasmaIdx::w     ][ip];
                 arrdata_elec[PlasmaIdx::ux     ][pidx] = ux * phys_const.c;
                 arrdata_elec[PlasmaIdx::uy     ][pidx] = uy * phys_const.c;
+                arrdata_elec[PlasmaIdx::phi_ion][pidx] = std::sqrt(1._rt + ux*ux + uy*uy + uz*uz + 0.5_rt*amrex::abs(A*A)) - m_beta_p * uz - 1._rt;
                 arrdata_elec[PlasmaIdx::psi    ][pidx] = std::sqrt(1._rt + ux*ux + uy*uy + uz*uz + 0.5_rt*amrex::abs(A*A))-uz; //psi = gamma - uz
                 arrdata_elec[PlasmaIdx::x_prev ][pidx] = arrdata_ion[PlasmaIdx::x_prev][ip];
                 arrdata_elec[PlasmaIdx::y_prev ][pidx] = arrdata_ion[PlasmaIdx::y_prev][ip];
@@ -777,6 +779,10 @@ InjectionCondition (const int lev, const Fields& fields, const MultiLaser& laser
         amrex::Long const num_particles = pti.numParticles();
 
 
+        amrex::Real a0 = laser.m_all_lasers[0].m_a0;
+        amrex::Real e_max = a0*a0/2*std::pow((1+a0*a0/2),-0.5_rt);
+        amrex::Real phi_min = e_max*e_max/2 - m_beta_p*std::sqrt((1+e_max*e_max/2)*(1+e_max*e_max/2)-1);
+
         // This kernel marks the plasma particles that has been injected in the wake
         amrex::ParallelFor(num_particles,
             [=] AMREX_GPU_DEVICE (int ip) {
@@ -804,7 +810,12 @@ InjectionCondition (const int lev, const Fields& fields, const MultiLaser& laser
 
                 amrex::Real condition = uz - uz_condition; // condition for injection
 
-                if (condition > 0 && Ezp < 0){
+                amrex::Real gam_p = std::sqrt(1._rt + ux*ux + uy*uy + uz*uz + 0.5_rt*amrex::abs(A*A));
+                amrex::Real gam_p_inv = 1/gam_p;
+                amrex::Real phi_ion = ptd_plasma.rdata(PlasmaIdx::phi_ion)[ip];
+                amrex::Real condition2 = phi_ion - phi_min + gam_p_inv - 1._rt;
+
+                if (condition2 > 0){
                     ptd_plasma.id(ip) = 3; // set the injected electron ID to 3
                 }
         });
