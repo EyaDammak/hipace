@@ -957,6 +957,7 @@ PlasmaParticleContainer::InSituComputeDiags (int islice)
 
     const amrex::Real insitu_radius_sq = m_insitu_radius * m_insitu_radius;
     const PhysConst phys_const = get_phys_const();
+    const amrex::Real clight = phys_const.c;
     const amrex::Real clight_inv = 1.0_rt/phys_const.c;
 
     // Loop over particle boxes
