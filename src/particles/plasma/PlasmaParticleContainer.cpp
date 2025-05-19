@@ -833,6 +833,7 @@ PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm,
     using namespace amrex::literals;
     using Complex = amrex::GpuComplex<amrex::Real>;
     const PhysConst phys_const = get_phys_const();
+    const amrex::Real clight = phys_const.c;
     const amrex::Real clight_inv = 1.0_rt/phys_const.c;
 
     auto laser_geom = laser.GetLaserGeom();
