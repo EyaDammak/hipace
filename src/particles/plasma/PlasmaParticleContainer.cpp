@@ -76,6 +76,7 @@ PlasmaParticleContainer::ReadParameters ()
     queryWithParser(pp, "can_laser_ionize", m_can_laser_ionize);
     queryWithParser(pp, "can_laser_injection", m_can_laser_injection);
     queryWithParser(pp, "injection_weight_factor", m_injection_weight_factor);
+    queryWithParser(pp, "injection_threshold_factor", m_injection_threshold_factor);
 
     m_can_ionize = m_can_field_ionize || m_can_laser_ionize;
 
@@ -760,6 +761,7 @@ InjectionCondition (const int lev, const Fields& fields, const MultiLaser& laser
      const amrex::Real dx_inv = laser_geom.InvCellSize(0);
      const amrex::Real dy_inv = laser_geom.InvCellSize(1);
      const amrex::Real dzeta_inv = laser_geom.InvCellSize(2);
+     const amrex::Real f_t = m_injection_threshold_factor;
 
      // extract dt for the condition of injection
      const amrex::Real dt = Hipace::GetInstance().m_dt;
@@ -808,7 +810,7 @@ InjectionCondition (const int lev, const Fields& fields, const MultiLaser& laser
                 const amrex::Real psi_inv = 1._rt / psi;
                 const amrex::Real gam_psi = gam * psi_inv;
 
-                amrex::Real condition = gam_psi - clight*dt*dzeta_inv; // condition for injection
+                amrex::Real condition = gam_psi - clight*dt*dzeta_inv*f_t; // condition for injection
 
                 if (ptd_plasma.id(ip)==2 && (condition >= 0)){
                     ptd_plasma.id(ip) = 3; // set the injected electron ID to 3
@@ -933,7 +935,7 @@ PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm,
                     ptd_beam.rdata(BeamIdx::uz)[pidx_beam] = (1+ux*ux+uy*uy - psi*psi + 0.5_rt*amrex::abs(A*A))/(2.*psi)*phys_const.c;
                     amrex::Real uz = ptd_beam.rdata(BeamIdx::uz)[pidx_beam] * clight_inv;
                     const amrex::Real gam = std::sqrt(1. + ux*ux + uy*uy + uz*uz + 0.5_rt*amrex::abs(A*A));
-                    ptd_beam.rdata(BeamIdx::w)[pidx_beam] = ptd_plasma.rdata(PlasmaIdx::w)[ip] * clight*dt*dzeta_inv;  //* gam / (psi) * f;
+                    ptd_beam.rdata(BeamIdx::w)[pidx_beam] = ptd_plasma.rdata(PlasmaIdx::w)[ip] * clight*dt*dzeta_inv *f;  //* gam / (psi) * f;
                     // conservation of j_x and j_y
                     ptd_beam.idata(BeamIdx::nsubcycles)[pidx_beam] = 0;
                     ptd_beam.idata(BeamIdx::mr_level)[pidx_beam] = 0;
