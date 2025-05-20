@@ -75,8 +75,8 @@ PlasmaParticleContainer::ReadParameters ()
     m_can_laser_injection = false;
     queryWithParser(pp, "can_laser_ionize", m_can_laser_ionize);
     queryWithParser(pp, "can_laser_injection", m_can_laser_injection);
-    queryWithParser(pp, "uz_threshold", m_uz_threshold);
     queryWithParser(pp, "injection_weight_factor", m_injection_weight_factor);
+    queryWithParser(pp, "injection_threshold_factor", m_injection_threshold_factor);
 
     m_can_ionize = m_can_field_ionize || m_can_laser_ionize;
 
@@ -750,8 +750,8 @@ InjectionCondition (const int lev, const Fields& fields, const MultiLaser& laser
     using namespace amrex::literals;
     using Complex = amrex::GpuComplex<amrex::Real>;
     const PhysConst phys_const = get_phys_const();
-    const amrex::Real clight_inv = 1.0_rt/phys_const.c;
-    amrex::Real uz_condition = m_uz_threshold;
+    const amrex::Real clight = phys_const.c;
+    const amrex::Real clight_inv = 1.0_rt/clight;
 
     auto laser_geom = laser.GetLaserGeom();
      // Offset for converting positions to indexes
@@ -761,14 +761,13 @@ InjectionCondition (const int lev, const Fields& fields, const MultiLaser& laser
      const amrex::Real dx_inv = laser_geom.InvCellSize(0);
      const amrex::Real dy_inv = laser_geom.InvCellSize(1);
      const amrex::Real dzeta_inv = laser_geom.InvCellSize(2);
+     const amrex::Real f_t = m_injection_threshold_factor;
+
+     // extract dt for the condition of injection
+     const amrex::Real dt = Hipace::GetInstance().m_dt;
 
     for (PlasmaParticleIterator pti(*this); pti.isValid(); ++pti)
     {
-        //extract slice_arr and ez_comp for Ez gathering
-        const amrex::FArrayBox& slice_fab = fields.getSlices(lev)[pti];
-        Array3<const amrex::Real> const slice_arr = slice_fab.const_array();
-        const int ez_comp = Comps[WhichSlice::This]["Ez"];
-
         // Extract laser array for A gathering
         Array3<const amrex::Real> const laser_arr = laser.getSlices().const_array(pti);
 
@@ -790,21 +789,20 @@ InjectionCondition (const int lev, const Fields& fields, const MultiLaser& laser
                 doLaserGatherShapeN<2>(xp, yp, A, A_dx, A_dzeta, laser_arr,
                     dx_inv, dy_inv, dzeta_inv, x_pos_offset, y_pos_offset);
 
-                // Gather Ez
-                amrex::Real Ezp = 0._rt;
-                doGatherEz(xp, yp, Ezp, slice_arr, ez_comp,
-                                       dx_inv, dy_inv, x_pos_offset, y_pos_offset);
-
                 // Calculation of uz
                 amrex::Real ux = ptd_plasma.rdata(PlasmaIdx::ux)[ip]*clight_inv;
                 amrex::Real uy = ptd_plasma.rdata(PlasmaIdx::uy)[ip]*clight_inv;
                 amrex::Real psi = ptd_plasma.rdata(PlasmaIdx::psi)[ip];
-                amrex::Real uz = (1 + ux*ux + uy*uy - psi*psi 
+                amrex::Real uz = (1 + ux*ux + uy*uy - psi*psi
                     + 0.5_rt*amrex::abs(A*A))/(2.*psi);
 
-                amrex::Real condition = uz - uz_condition; // condition for injection
+                const amrex::Real gam = std::sqrt(1. + ux*ux + uy*uy + uz*uz + 0.5_rt*amrex::abs(A*A));
+                const amrex::Real psi_inv = 1._rt / psi;
+                const amrex::Real gam_psi = gam * psi_inv;
 
-                if (ptd_plasma.id(ip)==2 && (condition > 0) && (Ezp < 0)){
+                amrex::Real condition = gam_psi - clight*dt*dzeta_inv*f_t; // condition for injection
+
+                if (ptd_plasma.id(ip)==2 && (condition >= 0)){
                     ptd_plasma.id(ip) = 3; // set the injected electron ID to 3
                 }
         });
@@ -825,6 +823,7 @@ PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm,
     using namespace amrex::literals;
     using Complex = amrex::GpuComplex<amrex::Real>;
     const PhysConst phys_const = get_phys_const();
+    const amrex::Real clight = phys_const.c;
     const amrex::Real clight_inv = 1.0_rt/phys_const.c;
 
     auto laser_geom = laser.GetLaserGeom();
@@ -909,7 +908,7 @@ PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm,
 
                     amrex::Real xp = ptd_plasma.pos(0, ip);
                     amrex::Real yp = ptd_plasma.pos(1, ip);
-    
+
                     doLaserGatherShapeN<2>(xp, yp, A, A_dx, A_dzeta, laser_arr,
                         dx_inv, dy_inv, dzeta_inv, x_pos_offset, y_pos_offset);
 
@@ -926,7 +925,7 @@ PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm,
                     ptd_beam.rdata(BeamIdx::uz)[pidx_beam] = (1+ux*ux+uy*uy - psi*psi + 0.5_rt*amrex::abs(A*A))/(2.*psi)*phys_const.c;
                     amrex::Real uz = ptd_beam.rdata(BeamIdx::uz)[pidx_beam] * clight_inv;
                     const amrex::Real gam = std::sqrt(1. + ux*ux + uy*uy + uz*uz + 0.5_rt*amrex::abs(A*A));
-                    ptd_beam.rdata(BeamIdx::w)[pidx_beam] = ptd_plasma.rdata(PlasmaIdx::w)[ip] * gam / (psi) * f;
+                    ptd_beam.rdata(BeamIdx::w)[pidx_beam] = ptd_plasma.rdata(PlasmaIdx::w)[ip] * clight*dt*dzeta_inv *f;  //* gam / (psi) * f;
                     // conservation of j_x and j_y
                     ptd_beam.idata(BeamIdx::nsubcycles)[pidx_beam] = 0;
                     ptd_beam.idata(BeamIdx::mr_level)[pidx_beam] = 0;
