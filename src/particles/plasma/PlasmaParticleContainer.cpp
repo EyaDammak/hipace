@@ -75,7 +75,6 @@ PlasmaParticleContainer::ReadParameters ()
     m_can_laser_injection = false;
     queryWithParser(pp, "can_laser_ionize", m_can_laser_ionize);
     queryWithParser(pp, "can_laser_injection", m_can_laser_injection);
-    queryWithParser(pp, "uz_threshold", m_uz_threshold);
     queryWithParser(pp, "injection_weight_factor", m_injection_weight_factor);
 
     m_can_ionize = m_can_field_ionize || m_can_laser_ionize;
@@ -752,7 +751,6 @@ InjectionCondition (const int lev, const Fields& fields, const MultiLaser& laser
     const PhysConst phys_const = get_phys_const();
     const amrex::Real clight = phys_const.c;
     const amrex::Real clight_inv = 1.0_rt/clight;
-    amrex::Real uz_condition = m_uz_threshold;
 
     auto laser_geom = laser.GetLaserGeom();
      // Offset for converting positions to indexes
@@ -958,7 +956,6 @@ PlasmaParticleContainer::InSituComputeDiags (int islice)
 
     const amrex::Real insitu_radius_sq = m_insitu_radius * m_insitu_radius;
     const PhysConst phys_const = get_phys_const();
-    const amrex::Real clight = phys_const.c;
     const amrex::Real clight_inv = 1.0_rt/phys_const.c;
 
     // Loop over particle boxes
