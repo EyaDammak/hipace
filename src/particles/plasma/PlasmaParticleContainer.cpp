@@ -766,11 +766,6 @@ InjectionCondition (const int lev, const Fields& fields, const MultiLaser& laser
 
     for (PlasmaParticleIterator pti(*this); pti.isValid(); ++pti)
     {
-        //extract slice_arr and ez_comp for Ez gathering
-        //const amrex::FArrayBox& slice_fab = fields.getSlices(lev)[pti];
-        //Array3<const amrex::Real> const slice_arr = slice_fab.const_array();
-        //const int ez_comp = Comps[WhichSlice::This]["Ez"];
-
         // Extract laser array for A gathering
         Array3<const amrex::Real> const laser_arr = laser.getSlices().const_array(pti);
 
@@ -791,11 +786,6 @@ InjectionCondition (const int lev, const Fields& fields, const MultiLaser& laser
                 Complex A_dzeta = 0;
                 doLaserGatherShapeN<2>(xp, yp, A, A_dx, A_dzeta, laser_arr,
                     dx_inv, dy_inv, dzeta_inv, x_pos_offset, y_pos_offset);
-
-                // Gather Ez
-                //amrex::Real Ezp = 0._rt;
-                //doGatherEz(xp, yp, Ezp, slice_arr, ez_comp,
-                //                       dx_inv, dy_inv, x_pos_offset, y_pos_offset);
 
                 // Calculation of uz
                 amrex::Real ux = ptd_plasma.rdata(PlasmaIdx::ux)[ip]*clight_inv;
