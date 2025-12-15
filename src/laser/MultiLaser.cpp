@@ -32,7 +32,6 @@ MultiLaser::ReadParameters ()
     m_use_laser = m_names[0] != "no_laser";
 
     if (!m_use_laser) return;
-    queryWithParser(pp, "lambda0", m_lambda0);
     DeprecatedInput("lasers", "3d_on_host", "comms_buffer.on_gpu", "", true);
     std::string polarization = "linear";
     queryWithParser(pp, "polarization", polarization);
@@ -55,7 +54,12 @@ MultiLaser::ReadParameters ()
     }
 
     queryWithParser(pp, "insitu_period", m_insitu_period);
-    queryWithParser(pp, "insitu_file_prefix", m_insitu_file_prefix);
+    m_insitu_file_prefix = Hipace::m_output_folder + "/insitu";
+    const bool set_file_prefix = queryWithParser(pp, "insitu_file_prefix", m_insitu_file_prefix);
+    if (set_file_prefix) {
+        amrex::Print() <<
+            "It is recommended to use hipace.output_folder instead of lasers.insitu_file_prefix\n";
+    }
 }
 
 
@@ -109,8 +113,28 @@ MultiLaser::MakeLaserGeometry (const amrex::Geometry& field_geom_3D)
     m_nlasers = m_names.size();
 
     for (int i = 0; i < m_nlasers; ++i) {
-        m_all_lasers.emplace_back(Laser(m_names[i], m_laser_geom_3D));
+        m_all_lasers.emplace_back(Laser(m_names[i]));
+        m_all_lasers.back().ReadParameters(m_laser_geom_3D);
         amrex::Print()<<"Laser "+ m_names[i] + " loaded" << "\n";
+    }
+
+    if (m_nlasers > 0) {
+        for (int i = 0; i < m_nlasers; ++i) {
+            if (i == 0) {
+                m_lambda0 = m_all_lasers[i].m_init_lambda0;
+            } else {
+                AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                    m_all_lasers[i].m_init_lambda0 == m_lambda0,
+                    "The central wavelength (lambda0) of all lasers must be identical. Note that "
+                    "for lasers read from an openPMD file, lambda0 is also read from the file.\n" +
+                    m_names[0] + " lambda0: " + amrex::ToString(m_lambda0) + "\n" +
+                    m_names[1] + " lambda0: " + amrex::ToString(m_all_lasers[i].m_init_lambda0) +
+                    "\ndifference: " + amrex::ToString(m_lambda0 - m_all_lasers[i].m_init_lambda0)
+                );
+            }
+        }
+    } else {
+        getWithParser(pp, "lambda0", m_lambda0);
     }
 
     m_slice_box = domain_3D_laser;
@@ -849,8 +873,6 @@ MultiLaser::InitLaserSlice (const int islice, const int comp)
                     arr(i, j, k, comp + 1 ) += arr_ff(i, j, islice, 1 );
                 }
                 );
-                AMREX_ASSERT_WITH_MESSAGE(laser.m_lambda0_from_file == m_lambda0 && m_lambda0 != 0,
-                "The central wavelength of laser from openPMD file and other lasers must be identical");
             }
             if (laser.m_laser_init_type == "parser") {
                 auto profile_real = laser.m_profile_real;
@@ -873,15 +895,20 @@ MultiLaser::InitLaserSlice (const int islice, const int comp)
             }
             else if (laser.m_laser_init_type == "gaussian") {
                 const amrex::Real a0 = laser.m_a0;
-                const amrex::Real w0 = laser.m_w0;
+                const amrex::Real w0_2 = laser.m_w0 * laser.m_w0;
+                const amrex::Real inv_tau2 = 1/(laser.m_tau*laser.m_tau);
                 const amrex::Real cep = laser.m_CEP;
                 const amrex::Real propagation_angle_yz = laser.m_propagation_angle_yz;
-                const amrex::Real PFT_yz = laser.m_PFT_yz - MathConst::pi/2.0;
                 const amrex::Real x0 = laser.m_position_mean[0];
                 const amrex::Real y0 = laser.m_position_mean[1];
                 const amrex::Real z0 = laser.m_position_mean[2];
                 const amrex::Real L0 = laser.m_L0;
                 const amrex::Real zfoc = laser.m_focal_distance;
+                const amrex::Real zeta = laser.m_zeta;
+                const amrex::Real beta = laser.m_beta;
+                const amrex::Real phi2 = laser.m_phi2;
+                const amrex::Real clight = get_phys_const().c;
+                const amrex::Real theta_xy = laser.m_STC_theta_xy;
                 amrex::ParallelFor(
                 bx,
                 [=] AMREX_GPU_DEVICE(int i, int j, int k)
@@ -890,25 +917,33 @@ MultiLaser::InitLaserSlice (const int islice, const int comp)
                     const amrex::Real y = j * dx_arr[1] + poff_y - y0;
                     const amrex::Real z = islice * dx_arr[2] + poff_z - z0;
                     // Coordinate rotation in yz plane for a laser propagating at an angle.
-                    const amrex::Real yp = std::cos( propagation_angle_yz + PFT_yz ) * y \
-                        - std::sin( propagation_angle_yz + PFT_yz ) * z;
-                    const amrex::Real zp = std::sin( propagation_angle_yz + PFT_yz ) * y \
-                        + std::cos( propagation_angle_yz + PFT_yz ) * z;
+                    const amrex::Real yp = std::cos(propagation_angle_yz) * y \
+                        - std::sin( propagation_angle_yz ) * z;
+                    const amrex::Real zp = std::sin(propagation_angle_yz) * y \
+                        + std::cos(propagation_angle_yz) * z;
                     // For first laser, setval to 0.
                     if (ilaser == 0) {
                         arr(i, j, k, comp ) = 0._rt;
                         arr(i, j, k, comp + 1 ) = 0._rt;
                     }
                     // Compute envelope for time step 0
-                    Complex diffract_factor = 1._rt + I * ( zp - zfoc + z0 * std::cos( propagation_angle_yz ) ) \
-                       * 2._rt/( k0 * w0 * w0 );
-                    Complex inv_complex_waist_2 = 1._rt /( w0 * w0 * diffract_factor );
+                    Complex diffract_factor = 1._rt + I * (zp - zfoc + z0 * std::cos(propagation_angle_yz)) \
+                       * 2._rt/(k0 * w0_2);
+                    Complex inv_complex_waist_2 = 1._rt /(w0_2 * diffract_factor);
+                    // Time stretching due to STCs and phi2 complex envelope
+                    // (1 if zeta=0, beta=0, phi2=0)
+                    Complex stretch_factor = 1._rt \
+                        + 4._rt * (zeta - beta * zfoc) * inv_tau2 * (zeta - beta * zfoc) * inv_complex_waist_2 \
+                        + 2._rt * I * (-phi2 - beta * beta * k0 * zfoc) * inv_tau2;
                     Complex prefactor = a0 / diffract_factor;
-                    Complex time_exponent = zp * zp / ( L0 * L0 );
-                    Complex stcfactor = prefactor * amrex::exp( - time_exponent );
-                    Complex exp_argument = - ( x * x + yp * yp ) * inv_complex_waist_2;
-                    Complex envelope = stcfactor * amrex::exp( exp_argument ) * \
-                       amrex::exp(I * yp * k0 * propagation_angle_yz + cep );
+                    Complex time_exponent = 1._rt / ( stretch_factor * L0 * L0 ) *
+                        amrex::pow(zp + beta * k0 * (x * std::cos(theta_xy) + yp * std::sin(theta_xy)) * clight \
+                        -2._rt * I * (x * std::cos(theta_xy) + yp * std::sin(theta_xy))\
+                        * (zeta + beta * zfoc) * clight * inv_complex_waist_2, 2);
+                    Complex stcfactor = prefactor * amrex::exp( - time_exponent);
+                    Complex exp_argument = - (x * x + yp * yp) * inv_complex_waist_2;
+                    Complex envelope = stcfactor * amrex::exp(exp_argument) * \
+                       amrex::exp(I * yp * k0 * propagation_angle_yz + cep);
                     arr(i, j, k, comp ) += envelope.real();
                     arr(i, j, k, comp + 1 ) += envelope.imag();
                     }
@@ -938,7 +973,9 @@ MultiLaser::InSituComputeDiags (int step, amrex::Real time, int islice,
     const amrex::Real poff_y = GetPosOffset(1, m_laser_geom_3D, m_laser_geom_3D.Domain());
     const amrex::Real dx = m_laser_geom_3D.CellSize(0);
     const amrex::Real dy = m_laser_geom_3D.CellSize(1);
-    const amrex::Real dxdydz = dx * dy * m_laser_geom_3D.CellSize(2);
+    const amrex::Real dz = m_laser_geom_3D.CellSize(2);
+    const amrex::Real dz2i = 1./(2. * dz);
+    const amrex::Real dxdydz = dx * dy * dz;
 
     const int xmid_lo = m_laser_geom_3D.Domain().smallEnd(0) + (m_laser_geom_3D.Domain().length(0) - 1) / 2;
     const int xmid_hi = m_laser_geom_3D.Domain().smallEnd(0) + (m_laser_geom_3D.Domain().length(0)) / 2;
@@ -961,7 +998,11 @@ MultiLaser::InSituComputeDiags (int step, amrex::Real time, int islice,
                 const amrex::Real areal = arr(i,j, n00j00_r);
                 const amrex::Real aimag = arr(i,j, n00j00_i);
                 const amrex::Real aabssq = abssq(areal, aimag);
-
+                // At this point, n00jp2 actually contains the data of n00jm1
+                const amrex::Real chidzabssq = arr(i,j, chi) * (
+                     - abssq(arr(i,j, n00jp2_r), arr(i,j, n00jp2_i))
+                     + abssq(arr(i,j, n00jp1_r), arr(i,j, n00jp1_i))
+                    ) * dz2i;
                 const amrex::Real x = i * dx + poff_x;
                 const amrex::Real y = j * dy + poff_y;
 
@@ -975,7 +1016,8 @@ MultiLaser::InSituComputeDiags (int step, amrex::Real time, int islice,
                     aabssq*x*x,     // 3    [|a|^2*x*x]
                     aabssq*y,       // 4    [|a|^2*y]
                     aabssq*y*y,     // 5    [|a|^2*y*y]
-                    aaxis           // 6    axis(a)
+                    chidzabssq,     // 6    [chi*d_z|a|^2]
+                    aaxis           // 7    axis(a)
                 };
             });
     }
@@ -1041,6 +1083,7 @@ MultiLaser::InSituWriteToFile (int step, amrex::Real time, int max_step, amrex::
         {"[|a|^2*x*x]"    , &m_insitu_rdata[3*nslices], nslices},
         {"[|a|^2*y]"      , &m_insitu_rdata[4*nslices], nslices},
         {"[|a|^2*y*y]"    , &m_insitu_rdata[5*nslices], nslices},
+        {"[chi*d_z|a|^2]" , &m_insitu_rdata[6*nslices], nslices},
         {"axis(a)"        , &m_insitu_cdata[0], nslices},
         {"integrated", {
             {"max(|a|^2)"     , &m_insitu_sum_rdata[0]},
@@ -1048,7 +1091,8 @@ MultiLaser::InSituWriteToFile (int step, amrex::Real time, int max_step, amrex::
             {"[|a|^2*x]"      , &m_insitu_sum_rdata[2]},
             {"[|a|^2*x*x]"    , &m_insitu_sum_rdata[3]},
             {"[|a|^2*y]"      , &m_insitu_sum_rdata[4]},
-            {"[|a|^2*y*y]"    , &m_insitu_sum_rdata[5]}
+            {"[|a|^2*y*y]"    , &m_insitu_sum_rdata[5]},
+            {"[chi*d_z|a|^2]" , &m_insitu_sum_rdata[6]}
         }}
     };
 

@@ -18,12 +18,8 @@ class MultiPlasma
 
 public:
 
-    /** Constructor
-     */
-    MultiPlasma ();
-
-    /** Destructor */
-    ~MultiPlasma () {}
+    /** Read parameters from the input file */
+    void ReadParameters ();
 
     /** \brief Loop over plasma species and initialize them.
      *
@@ -54,6 +50,16 @@ public:
     void DepositCurrent (
         Fields & fields, int which_slice, bool deposit_jx_jy,
         bool deposit_jz, bool deposit_rho, bool deposit_chi, bool deposit_rhomjz,
+        amrex::Vector<amrex::Geometry> const& gm, int const lev);
+
+    /** Loop over plasma species and deposit their temperature into the current 2D slice in fields
+     *
+     * \param[in,out] fields the general field class, modified by this function
+     * \param[in] gm Geometry of the simulation, to get the cell size etc.
+     * \param[in] lev MR level
+     */
+    void DoDepositTemperature (
+        Fields & fields,
         amrex::Vector<amrex::Geometry> const& gm, int const lev);
 
     /** Loop over plasma species and depose Sx and Sy into the current 2D slice in fields
@@ -114,22 +120,22 @@ public:
 
     /** Do the transfer of ionized plasma particles to beam particles
      *
-     * \param[in] lev MR level
-     * \param[in] fields the general field class
-     * \param[in] laser MultiLaser object containing the laser details
      * \param[in] gm Geometry object for the whole domain
      * \param[in] islice Slice index corresponding to the current simulation slice
      */
-    void DoLaserInjection (const int lev, const Fields& fields, const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm, const int islice);
+    void DoLaserInjection (amrex::Vector<amrex::Geometry> const& gm, const int islice);
 
     /** \brief whether any plasma species uses a neutralizing background, e.g. no ion motion */
-    bool AnySpeciesNeutralizeBackground () const;
+    [[nodiscard]] bool
+    AnySpeciesNeutralizeBackground () const;
 
     /** returns a Vector of names of the plasmas */
-    const amrex::Vector<std::string>& GetNames() const {return m_names;}
+    [[nodiscard]] const amrex::Vector<std::string>&
+    GetNames() const {return m_names;}
 
     /** returns number of plasma species */
-    int GetNPlasmas() const {return m_nplasmas;}
+    [[nodiscard]] int
+    GetNPlasmas() const {return m_nplasmas;}
 
     /** Reorder particles to speed-up current deposition
      * \param[in] islice zeta slice index

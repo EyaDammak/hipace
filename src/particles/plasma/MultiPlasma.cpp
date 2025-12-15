@@ -8,6 +8,7 @@
 #include "MultiPlasma.H"
 #include "particles/beam/MultiBeam.H"
 #include "particles/deposition/PlasmaDepositCurrent.H"
+#include "particles/deposition/TemperatureDeposition.H"
 #include "particles/deposition/ExplicitDeposition.H"
 #include "particles/pusher/PlasmaParticleAdvance.H"
 #include "utils/HipaceProfilerWrapper.H"
@@ -15,7 +16,8 @@
 #include "utils/IOUtil.H"
 #include "Hipace.H"
 
-MultiPlasma::MultiPlasma ()
+void
+MultiPlasma::ReadParameters ()
 {
     amrex::ParmParse pp("plasmas");
     queryWithParser(pp, "names", m_names);
@@ -32,6 +34,7 @@ MultiPlasma::MultiPlasma ()
     for (int i = 0; i < m_nplasmas; ++i) {
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(m_names[i]!="beam", "Cannot have plasma with name 'beam'");
         m_all_plasmas.emplace_back(PlasmaParticleContainer(m_names[i]));
+        m_all_plasmas.back().ReadParameters();
     }
 
 }
@@ -45,7 +48,7 @@ MultiPlasma::InitData (amrex::Vector<amrex::BoxArray> slice_ba,
     for (auto& plasma : m_all_plasmas) {
         // make it think there is only level 0
         plasma.SetParGDB(slice_gm[0], slice_dm[0], slice_ba[0]);
-        plasma.InitData(gm[0]);
+        plasma.InitData(gm);
 
         if(plasma.m_can_ionize) {
             for (int i=0; i<m_names.size(); ++i) {
@@ -95,6 +98,16 @@ MultiPlasma::DepositCurrent (
         ::DepositCurrent(m_all_plasmas[i], fields, which_slice,
                          deposit_jx_jy, deposit_jz, deposit_rho, deposit_chi, deposit_rhomjz,
                          gm, lev);
+    }
+}
+
+void
+MultiPlasma::DoDepositTemperature (
+    Fields & fields,
+    amrex::Vector<amrex::Geometry> const& gm, int const lev)
+{
+    for (int i=0; i<m_nplasmas; i++) {
+        ::DepositTemperature(m_all_plasmas[i], fields, gm, lev);
     }
 }
 
@@ -153,11 +166,10 @@ MultiPlasma::DoLaserIonization (
 
 void
 MultiPlasma::DoLaserInjection (
-    const int lev, const Fields& fields, const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm, const int islice)
+    amrex::Vector<amrex::Geometry> const& gm, const int islice)
 {
     for (auto& plasma : m_all_plasmas) {
-        plasma.InjectionCondition(lev, fields, laser, islice);
-        plasma.PlasmaToBeam(laser, gm, islice);
+        plasma.PlasmaToBeam(gm, islice);
     }
 }
 

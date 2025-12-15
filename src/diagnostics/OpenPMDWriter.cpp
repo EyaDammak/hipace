@@ -15,7 +15,70 @@
 
 #ifdef HIPACE_USE_OPENPMD
 
-OpenPMDWriter::OpenPMDWriter ()
+#include <openPMD/openPMD.hpp>
+
+namespace utils {
+    std::pair< std::string, std::string >
+    name2openPMD ( std::string const& fullName )
+    {
+        std::string record_name = fullName;
+        std::string component_name = openPMD::RecordComponent::SCALAR;
+        std::size_t startComp = fullName.find_last_of("_");
+
+        if( startComp != std::string::npos ) {  // non-scalar
+            record_name = fullName.substr(0, startComp);
+            component_name = fullName.substr(startComp + 1u);
+        }
+        return make_pair(record_name, component_name);
+    }
+
+    /** Get the openPMD physical dimensionality of a record
+     *
+     * @param record_name name of the openPMD record
+     * @return map with base quantities and power scaling
+     */
+    std::map< openPMD::UnitDimension, double >
+    getUnitDimension ( std::string const & record_name )
+    {
+
+        if( (record_name == "position") ||
+            (record_name == "positionOffset")) return {
+            {openPMD::UnitDimension::L,  1.}
+        };
+        else if( record_name == "momentum" ) return {
+            {openPMD::UnitDimension::L,  1.},
+            {openPMD::UnitDimension::M,  1.},
+            {openPMD::UnitDimension::T, -1.}
+        };
+        else if( record_name == "charge" ) return {
+            {openPMD::UnitDimension::T,  1.},
+            {openPMD::UnitDimension::I,  1.}
+        };
+        else if( record_name == "mass" ) return {
+            {openPMD::UnitDimension::M,  1.}
+        };
+        else if( record_name == "E" ) return {
+            {openPMD::UnitDimension::L,  1.},
+            {openPMD::UnitDimension::M,  1.},
+            {openPMD::UnitDimension::T, -3.},
+            {openPMD::UnitDimension::I, -1.},
+        };
+        else if( record_name == "B" ) return {
+            {openPMD::UnitDimension::M,  1.},
+            {openPMD::UnitDimension::I, -1.},
+            {openPMD::UnitDimension::T, -2.}
+        };
+        else if( record_name == "spin" ) return {
+            {openPMD::UnitDimension::L,  2.},
+            {openPMD::UnitDimension::M,  1.},
+            {openPMD::UnitDimension::T, -1.}
+        };
+        else return {};
+    }
+}
+
+void
+OpenPMDWriter::ReadParameters ()
 {
     amrex::ParmParse pp("hipace");
     queryWithParser(pp, "openpmd_backend", m_openpmd_backend);
@@ -32,19 +95,27 @@ OpenPMDWriter::OpenPMDWriter ()
 
     // set default output path according to backend
     if (m_openpmd_backend == "h5") {
-        m_file_prefix = "diags/hdf5";
+        m_file_prefix = Hipace::m_output_folder + "/hdf5";
     } else if (m_openpmd_backend == "bp") {
-        m_file_prefix = "diags/adios2";
+        m_file_prefix = Hipace::m_output_folder + "/adios2";
     } else if (m_openpmd_backend == "json") {
-        m_file_prefix = "diags/json";
+        m_file_prefix = Hipace::m_output_folder + "/json";
     }
     // overwrite output path by choice of the user
-    queryWithParser(pp, "file_prefix", m_file_prefix);
+    const bool set_file_prefix = queryWithParser(pp, "file_prefix", m_file_prefix);
+    if (set_file_prefix) {
+        amrex::Print() <<
+            "It is recommended to use hipace.output_folder instead of hipace.file_prefix\n";
+    }
 
     // temporary workaround until openPMD-viewer gets fixed
     amrex::ParmParse ppd("diagnostic");
     queryWithParser(ppd, "openpmd_viewer_u_workaround", m_openpmd_viewer_workaround);
 }
+
+OpenPMDWriter::OpenPMDWriter () {}
+
+OpenPMDWriter::~OpenPMDWriter() {}
 
 void
 OpenPMDWriter::InitDiagnostics ()
@@ -88,7 +159,7 @@ OpenPMDWriter::WriteFieldDiagnostics (
 
 void
 OpenPMDWriter::WriteFieldData (
-    const FieldDiagnosticData& fd, const MultiLaser& a_multi_laser, openPMD::Iteration iteration)
+    const FieldDiagnosticData& fd, const MultiLaser& a_multi_laser, openPMD::Iteration& iteration)
 {
     HIPACE_PROFILE("OpenPMDWriter::WriteFieldData()");
 
@@ -147,13 +218,15 @@ OpenPMDWriter::WriteFieldData (
 
         if (is_laser_comp) {
             // set laser attributes and store laser
-            field.setAttribute("envelopeField", "normalized_vector_potential");
-            field.setAttribute("angularFrequency",
-                double(2.) * MathConst::pi * PhysConstSI::c / a_multi_laser.GetLambda0());
-            std::vector< std::complex<double> > polarization {{1., 0.}, {0., 0.}};
-            field.setAttribute("polarization", polarization);
+            if (fd.m_comps_output[icomp] == "laserEnvelope") {
+                field.setAttribute("envelopeField", "normalized_vector_potential");
+                field.setAttribute("angularFrequency",
+                    double(2.) * MathConst::pi * PhysConstSI::c / a_multi_laser.GetLambda0());
+                std::vector< std::complex<double> > polarization {{1., 0.}, {0., 0.}};
+                field.setAttribute("polarization", polarization);
+            }
             field_comp.storeChunkRaw(
-                reinterpret_cast<const std::complex<amrex::Real>*>(fd.m_F_laser.dataPtr()),
+                reinterpret_cast<const std::complex<amrex::Real>*>(fd.m_F_laser.dataPtr(icomp)),
                 chunk_offset, chunk_size);
         } else {
             field_comp.storeChunkRaw(fd.m_F.dataPtr(icomp), chunk_offset, chunk_size);
@@ -175,8 +248,14 @@ OpenPMDWriter::InitBeamData (MultiBeam& beams, const amrex::Vector< std::string 
         std::string name = beams.get_name(ibeam);
         if(std::find(beamnames.begin(), beamnames.end(), name) ==  beamnames.end() ) continue;
 
+        auto& beam = beams.getBeam(ibeam);
+
         // initialize beam IO on first slice
-        const uint64_t np_total = beams.getBeam(ibeam).getTotalNumParticles();
+        uint64_t np_total = beam.getTotalNumParticles();
+
+        if (beam.m_output_ratio > 1) {
+            np_total = (np_total + beam.m_output_ratio - 1) / beam.m_output_ratio;
+        }
 
         m_uint64_beam_data[ibeam].resize(m_int_names.size());
 
@@ -184,7 +263,7 @@ OpenPMDWriter::InitBeamData (MultiBeam& beams, const amrex::Vector< std::string 
             m_uint64_beam_data[ibeam][idx].resize(np_total);
         }
 
-        if (beams.getBeam(ibeam).m_do_spin_tracking) {
+        if (beam.m_do_spin_tracking) {
             m_real_beam_data[ibeam].resize(m_real_names.size() + m_real_names_spin.size());
         } else {
             m_real_beam_data[ibeam].resize(m_real_names.size());
@@ -200,7 +279,7 @@ OpenPMDWriter::InitBeamData (MultiBeam& beams, const amrex::Vector< std::string 
 }
 
 void
-OpenPMDWriter::WriteBeamParticleData (MultiBeam& beams, openPMD::Iteration iteration,
+OpenPMDWriter::WriteBeamParticleData (MultiBeam& beams, openPMD::Iteration& iteration,
                                       const amrex::Geometry& geom,
                                       const amrex::Vector< std::string > beamnames)
 {
@@ -278,7 +357,17 @@ OpenPMDWriter::CopyBeams (MultiBeam& beams, const amrex::Vector< std::string > b
 
         auto& beam = beams.getBeam(ibeam);
 
-        const uint64_t np = beam.getNumParticles(WhichBeamSlice::This);
+        uint64_t np = beam.getNumParticles(WhichBeamSlice::This);
+
+        const int output_ratio = beam.m_output_ratio;
+
+        if (output_ratio > 1) {
+            np = amrex::partitionParticles(beam.getBeamSlice(WhichBeamSlice::This),
+                [=] AMREX_GPU_DEVICE (auto& ptd, int i) {
+                    return i < int(np) && ptd.idcpu(i) % output_ratio == 0;
+                }
+            );
+        }
 
         if (np != 0) {
             // copy data from GPU to IO buffer
@@ -298,7 +387,7 @@ OpenPMDWriter::CopyBeams (MultiBeam& beams, const amrex::Vector< std::string > b
             }
 
             AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-                int(m_real_beam_data[ibeam].size()) == soa.NumRealComps(),
+                int(m_real_beam_data[ibeam].size()) == (soa.NumRealComps() - 1),
                 "List of real names in openPMD Writer class does not match the beam");
 
             for (std::size_t idx=0; idx<m_real_beam_data[ibeam].size(); idx++) {
@@ -308,9 +397,10 @@ OpenPMDWriter::CopyBeams (MultiBeam& beams, const amrex::Vector< std::string > b
                         std::max<uint64_t>(old_size+old_size/4, m_offset[ibeam] + np)
                     );
                 }
+                const int get_idx = idx >= BeamIdx::nsubcycles ? idx+1 : idx;
                 amrex::Gpu::copyAsync(amrex::Gpu::deviceToHost,
-                    soa.GetRealData(idx).begin(),
-                    soa.GetRealData(idx).begin() + np,
+                    soa.GetRealData(get_idx).begin(),
+                    soa.GetRealData(get_idx).begin() + np,
                     m_real_beam_data[ibeam][idx].data() + m_offset[ibeam]);
             }
         }
@@ -348,8 +438,8 @@ OpenPMDWriter::SetupPos (openPMD::ParticleSpecies& currSpecies, BeamParticleCont
     // calculate the multiplier to convert from Hipace to SI units
     double hipace_to_SI_pos = 1.;
     double hipace_to_SI_weight = 1.;
-    double hipace_to_SI_momentum = beam.m_mass;
-    double hipace_to_unitSI_momentum = beam.m_mass;
+    double hipace_to_SI_momentum = beam.m_mass * phys_const_SI.c;
+    double hipace_to_unitSI_momentum = beam.m_mass * phys_const_SI.c;
     double hipace_to_SI_charge = 1.;
     double hipace_to_SI_mass = 1.;
 

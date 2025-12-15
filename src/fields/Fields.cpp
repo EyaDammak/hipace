@@ -26,9 +26,11 @@
 
 using namespace amrex::literals;
 
-Fields::Fields (const int nlev)
-    : m_slices(nlev)
+void
+Fields::ReadParameters (const int nlev)
 {
+    m_slices = decltype(m_slices)(nlev);
+
     amrex::ParmParse ppf("fields");
     DeprecatedInput("fields", "do_dirichlet_poisson", "poisson_solver", "");
     // set default Poisson solver based on the platform
@@ -39,7 +41,12 @@ Fields::Fields (const int nlev)
 #endif
     queryWithParser(ppf, "poisson_solver", m_poisson_solver_str);
     queryWithParser(ppf, "insitu_period", m_insitu_period);
-    queryWithParser(ppf, "insitu_file_prefix", m_insitu_file_prefix);
+    m_insitu_file_prefix = Hipace::m_output_folder + "/insitu";
+    const bool set_file_prefix = queryWithParser(ppf, "insitu_file_prefix", m_insitu_file_prefix);
+    if (set_file_prefix) {
+        amrex::Print() <<
+            "It is recommended to use hipace.output_folder instead of fields.insitu_file_prefix\n";
+    }
     queryWithParser(ppf, "do_symmetrize", m_do_symmetrize);
     DeprecatedInput("fields", "extended_solve",
                     "boundary.particle_lo and boundary.particle_hi", "", true);
@@ -75,6 +82,9 @@ Fields::AllocData (
 
             int isl = WhichSlice::Next;
             Comps[isl].multi_emplace(N_Comps, "jx_beam", "jy_beam");
+            if (Hipace::m_depos_order_z == 2) {
+                Comps[isl].multi_emplace(N_Comps, "jx", "jy", "Ez");
+            }
 
             isl = WhichSlice::This;
             // (Bx, By), (Sy, Sx) and (chi, chi2) adjacent for explicit solver
@@ -96,12 +106,21 @@ Fields::AllocData (
                     Comps[isl].multi_emplace(N_Comps, "rho_" + plasma_name);
                 }
             }
+            if (Hipace::m_deposit_temp_individual) {
+                for (auto& plasma_name : Hipace::GetInstance().m_multi_plasma.GetNames()) {
+                    Comps[isl].multi_emplace(N_Comps, "w_" + plasma_name, "ux_" + plasma_name, "uy_" + plasma_name,
+                    "uz_" + plasma_name, "ux^2_" + plasma_name, "uy^2_" + plasma_name, "uz^2_" + plasma_name);
+                }
+            }
             if (Hipace::m_do_beam_jz_minus_rho) {
                 Comps[isl].multi_emplace(N_Comps, "rhomjz_beam");
             }
 
             isl = WhichSlice::Previous;
             Comps[isl].multi_emplace(N_Comps, "jx_beam", "jy_beam");
+            if (Hipace::m_depos_order_z == 2) {
+                Comps[isl].multi_emplace(N_Comps, "Ez");
+            }
 
             isl = WhichSlice::RhomJzIons;
             if (m_any_neutral_background) {
@@ -127,6 +146,9 @@ Fields::AllocData (
 
             int isl = WhichSlice::Next;
             Comps[isl].multi_emplace(N_Comps, "jx", "jy");
+            if (Hipace::m_depos_order_z == 2) {
+                Comps[isl].multi_emplace(N_Comps, "Ez");
+            }
 
             isl = WhichSlice::This;
             // Bx and By adjacent for explicit solver
@@ -144,10 +166,18 @@ Fields::AllocData (
                     Comps[isl].multi_emplace(N_Comps, "rho_" + plasma_name);
                 }
             }
+            if (Hipace::m_deposit_temp_individual) {
+                for (auto& plasma_name : Hipace::GetInstance().m_multi_plasma.GetNames()) {
+                    Comps[isl].multi_emplace(N_Comps, "w_" + plasma_name, "ux_" + plasma_name, "uy_" + plasma_name,
+                    "uz_" + plasma_name, "ux^2_" + plasma_name, "uy^2_" + plasma_name, "uz^2_" + plasma_name);
+                }
+            }
 
             isl = WhichSlice::Previous;
             Comps[isl].multi_emplace(N_Comps, "Bx", "By", "jx", "jy");
-
+            if (Hipace::m_depos_order_z == 2) {
+                Comps[isl].multi_emplace(N_Comps, "Ez");
+            }
 
             isl = WhichSlice::RhomJzIons;
             if (m_any_neutral_background) {
@@ -439,16 +469,15 @@ Fields::Copy (const int current_N_level, const int i_slice, FieldDiagnosticData&
     if (fd.m_slice_dir != 2) {
         // Put contributions from i_slice to different diag_fab slices in GPU vector
         m_rel_z_vec.resize(k_max+1-k_min);
-        m_rel_z_vec_cpu.resize(k_max+1-k_min);
         for (int k=k_min; k<=k_max; ++k) {
             const amrex::Real pos = k * fd.m_geom_io.CellSize(2) + poff_diag_z;
             const amrex::Real mid_i_slice = (pos - poff_calc_z)*field_geom[0].InvCellSize(2);
             amrex::Real sz_cell[depos_order_z + 1];
             const int k_cell = compute_shape_factor<depos_order_z>(sz_cell, mid_i_slice);
-            m_rel_z_vec_cpu[k-k_min] = 0;
+            m_rel_z_vec[k-k_min] = 0;
             for (int i=0; i<=depos_order_z; ++i) {
                 if (k_cell+i == i_slice) {
-                    m_rel_z_vec_cpu[k-k_min] = sz_cell[i];
+                    m_rel_z_vec[k-k_min] = sz_cell[i];
                 }
             }
         }
@@ -457,21 +486,20 @@ Fields::Copy (const int current_N_level, const int i_slice, FieldDiagnosticData&
         int k_start = k_min;
         int k_stop = k_max;
         for (int k=k_min; k<=k_max; ++k) {
-            if (m_rel_z_vec_cpu[k-k_min] == 0) ++k_start;
+            if (m_rel_z_vec[k-k_min] == 0) ++k_start;
             else break;
         }
         for (int k=k_max; k>=k_min; --k) {
-            if (m_rel_z_vec_cpu[k-k_min] == 0) --k_stop;
+            if (m_rel_z_vec[k-k_min] == 0) --k_stop;
             else break;
         }
         diag_box.setSmall(2, amrex::max(diag_box.smallEnd(2), k_start));
         diag_box.setBig(2, amrex::min(diag_box.bigEnd(2), k_stop));
     } else {
         m_rel_z_vec.resize(1);
-        m_rel_z_vec_cpu.resize(1);
         const amrex::Real pos_z = i_slice * field_geom[0].CellSize(2) + poff_calc_z;
         if (fd.m_geom_io.ProbLo(2) <= pos_z && pos_z <= fd.m_geom_io.ProbHi(2)) {
-            m_rel_z_vec_cpu[0] = field_geom[0].CellSize(2);
+            m_rel_z_vec[0] = field_geom[0].CellSize(2);
             k_min = 0;
         } else {
             return;
@@ -485,15 +513,7 @@ Fields::Copy (const int current_N_level, const int i_slice, FieldDiagnosticData&
     auto laser_func = interpolated_field_xy<depos_order_xy,
         guarded_field_xy>{{laser_mf}, multi_laser.GetLaserGeom()};
 
-#ifdef AMREX_USE_GPU
-    // This async copy happens on the same stream as the ParallelFor below, which uses the copied array.
-    // Therefore, it is safe to do it async.
-    amrex::Gpu::htod_memcpy_async(m_rel_z_vec.dataPtr(), m_rel_z_vec_cpu.dataPtr(),
-                                  m_rel_z_vec_cpu.size() * sizeof(amrex::Real));
-#else
-    std::memcpy(m_rel_z_vec.dataPtr(), m_rel_z_vec_cpu.dataPtr(),
-                m_rel_z_vec_cpu.size() * sizeof(amrex::Real));
-#endif
+    m_rel_z_vec.copyToDeviceAsync();
 
     // Finally actual kernel: Interpolation in x, y, z of zero-extended fields
     for (amrex::MFIter mfi(slice_mf, DfltMfi); mfi.isValid(); ++mfi) {
@@ -506,27 +526,49 @@ Fields::Copy (const int current_N_level, const int i_slice, FieldDiagnosticData&
             current_N_level > fd.m_level) {
             auto slice_array = slice_func.array(mfi);
             amrex::Array4<amrex::Real> diag_array = fd.m_F.array();
+            const int comp_ExmBy = Comps[WhichSlice::This]["ExmBy"];
+            const int comp_EypBx = Comps[WhichSlice::This]["EypBx"];
+            const int comp_Bx = Comps[WhichSlice::This]["Bx"];
+            const int comp_By = Comps[WhichSlice::This]["By"];
+            const amrex::Real clight = get_phys_const().c;
             amrex::ParallelFor(diag_box, fd.m_nfields,
                 [=] AMREX_GPU_DEVICE(int i, int j, int k, int n) noexcept
                 {
                     const amrex::Real x = i * dx + poff_diag_x;
                     const amrex::Real y = j * dy + poff_diag_y;
                     const int m = n[diag_comps];
-                    diag_array(i,j,k,n) += rel_z_data[k-k_min] * slice_array(x,y,m);
+                    if (m == -1) { // Ex
+                        diag_array(i,j,k,n) += rel_z_data[k-k_min] * (
+                            slice_array(x,y,comp_ExmBy) + clight * slice_array(x,y,comp_By));
+                    } else if (m == -2) { // Ey
+                        diag_array(i,j,k,n) += rel_z_data[k-k_min] * (
+                            slice_array(x,y,comp_EypBx) - clight * slice_array(x,y,comp_Bx));
+                    } else {
+                        diag_array(i,j,k,n) += rel_z_data[k-k_min] * slice_array(x,y,m);
+                    }
                 });
         } else if (fd.m_base_geom_type == FieldDiagnosticData::geom_type::laser &&
                    multi_laser.UseLaser(i_slice)) {
             auto laser_array = laser_func.array(mfi);
             amrex::Array4<amrex::GpuComplex<amrex::Real>> diag_array_laser = fd.m_F_laser.array();
-            amrex::ParallelFor(diag_box,
-                [=] AMREX_GPU_DEVICE(int i, int j, int k) noexcept
+            amrex::ParallelFor(diag_box, fd.m_nfields,
+                [=] AMREX_GPU_DEVICE(int i, int j, int k, int n) noexcept
                 {
                     const amrex::Real x = i * dx + poff_diag_x;
                     const amrex::Real y = j * dy + poff_diag_y;
-                    diag_array_laser(i,j,k) += amrex::GpuComplex<amrex::Real> {
-                        rel_z_data[k-k_min] * laser_array(x,y,WhichLaserSlice::n00j00_r),
-                        rel_z_data[k-k_min] * laser_array(x,y,WhichLaserSlice::n00j00_i)
-                    };
+                    const int m = n[diag_comps];
+                    if (m == -1) { // real=|a^2|, imag=0
+                        diag_array_laser(i,j,k,n) += amrex::GpuComplex<amrex::Real>{
+                            rel_z_data[k-k_min] * abssq(
+                                laser_array(x,y,WhichLaserSlice::n00j00_r),
+                                laser_array(x,y,WhichLaserSlice::n00j00_i)),
+                            amrex::Real(0)};
+                    } else {
+                        diag_array_laser(i,j,k,n) += amrex::GpuComplex<amrex::Real>{
+                            rel_z_data[k-k_min] * laser_array(x,y,m),
+                            rel_z_data[k-k_min] * laser_array(x,y,m+1)
+                        };
+                    }
                 });
         }
     }
@@ -547,6 +589,9 @@ Fields::InitializeSlices (int lev, int islice, const amrex::Vector<amrex::Geomet
             LevelUp(geom, lev, WhichSlice::This, "jy_beam");
             duplicate(lev, WhichSlice::This, {"jx"     , "jy"     },
                            WhichSlice::This, {"jx_beam", "jy_beam"});
+            if (Hipace::m_depos_order_z == 2) {
+                LevelUp(geom, lev, WhichSlice::Previous, "Ez");
+            }
         }
         // Set all quantities on WhichSlice::This to 0 except:
         // Bx, By, Bz, Psi and Ez which are set by field solvers and
@@ -568,6 +613,9 @@ Fields::InitializeSlices (int lev, int islice, const amrex::Vector<amrex::Geomet
             LevelUp(geom, lev, WhichSlice::Previous, "By");
             LevelUp(geom, lev, WhichSlice::Previous, "jx");
             LevelUp(geom, lev, WhichSlice::Previous, "jy");
+            if (Hipace::m_depos_order_z == 2) {
+                LevelUp(geom, lev, WhichSlice::Previous, "Ez");
+            }
         }
         setVal(0., lev, WhichSlice::This,
             "ExmBy", "EypBx", "jx", "jy", "jz", "rhomjz");
@@ -581,6 +629,12 @@ Fields::InitializeSlices (int lev, int islice, const amrex::Vector<amrex::Geomet
     if (Hipace::m_deposit_rho_individual) {
         for (auto& plasma_name : Hipace::GetInstance().m_multi_plasma.GetNames()) {
             setVal(0., lev, WhichSlice::This, "rho_" + plasma_name);
+        }
+    }
+    if (Hipace::m_deposit_temp_individual) {
+        for (auto& plasma_name : Hipace::GetInstance().m_multi_plasma.GetNames()) {
+            setVal(0., lev, WhichSlice::This, "w_" + plasma_name, "ux_" + plasma_name, "uy_" + plasma_name,
+            "uz_" + plasma_name, "ux^2_" + plasma_name, "uy^2_" + plasma_name, "uz^2_" + plasma_name);
         }
     }
 }
@@ -600,6 +654,9 @@ Fields::ShiftSlices (int lev)
     } else {
         shift(lev, WhichSlice::PCPrevIter, WhichSlice::Previous, "Bx", "By");
         shift(lev, WhichSlice::Previous, WhichSlice::This, "Bx", "By", "jx", "jy");
+    }
+    if (Hipace::m_depos_order_z == 2) {
+        shift(lev, WhichSlice::Previous, WhichSlice::This, "Ez");
     }
 }
 

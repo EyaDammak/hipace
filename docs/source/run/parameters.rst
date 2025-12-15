@@ -104,6 +104,13 @@ General parameters
     laser slice to avoid a deadlock, i.e.
     ``comms_buffer.max_size_GiB * nranks > beam_size + laser_size``.
 
+* ``comms_buffer.max_open_requests`` (`int`) optional (default `1000`)
+    How many MPI requests may be open at the same time. Note that this is counted separately
+    for each of the four different kinds of requests used. Must be set to at least two.
+    Limiting the number of open requests is useful for simulations with many zeta slices
+    (`>10000`) to reduce work for the MPI implementation.
+    Note that setting the limit too low may result in a deadlock.
+
 * ``comms_buffer.max_leading_slices`` (`int`) optional (default `inf`)
     How many slices of beam particles can be received and stored in advance.
 
@@ -139,7 +146,8 @@ General parameters
     Transverse particle shape order. Currently, `0,1,2,3` are implemented.
 
 * ``hipace.depos_order_z`` (`int`) optional (default `0`)
-    Longitudinal particle shape order. Currently, only `0` is implemented.
+    Longitudinal particle shape order. Only affects the gathering of Ez for beam particles.
+    Can be 0 or 2.
 
 * ``hipace.depos_derivative_type`` (`int`) optional (default `2`)
     Type of derivative used in explicit deposition. `0`: analytic, `1`: nodal, `2`: centered
@@ -161,10 +169,15 @@ General parameters
     If a parameter is present multiple times then the last occurrence will be used.
     Note that this will include some default AMReX parameters.
 
-* ``hipace.grid_external_B(x,y,z,t)`` (3 `float`) optional (default `0. 0. 0.`)
-    External magnetic field applied to the field grid as a function of x, y, z and t.
+* ``hipace.initial_time`` (`float`) optional (default `0.`)
+    Initial time of the simulation. Can be used to start at a chosen location in a custom density profile or to overwrite the initial time set e.g. with the ``from_file`` option of beam initialization.
+
+* ``hipace.grid_external_fields(x,y,z,t)`` (5 `float`) optional (default `0. 0. 0. 0. 0.`)
+    External fields applied to the field grid as a function of x, y, z and t.
     This will affect both beam and plasma particles, as well as the field diagnostics.
-    The components represent Bx, By and Bz respectively.
+    The components represent Bx, By, Bz, Psi and Ez respectively.
+    The plasma wake potential :math:`\Psi = \phi - cA_z` must satisfy
+    :math:`\frac{d}{dx} \Psi = - (E_x - c B_y)` and :math:`\frac{d}{dy} \Psi = - (E_y + c B_x)`.
     Note that z refers to the location of the beam particle inside the moving frame of reference
     (zeta) and t to the physical time of the current time step.
 
@@ -226,6 +239,15 @@ Geometry
 * ``mr_lev1.patch_hi`` (3 `float`)
     Upper end of the refined grid in x, y and z.
 
+* ``mr_lev1.ref_ratio`` (2 `float`) optional (default `0 0`)
+    The refinement ratio of level 1 compared to level 0 in the x and y directions. If specified,
+    ``patch_lo`` and ``patch_hi`` will be adjusted by up to 5% to match the requested refinement ratio.
+
+* ``mr_lev1.plasma_fine_patch`` (2 `float`) optional (default `0 0`)
+    Enable a fine patch for all plasmas using the location and refinement ratio of level 1.
+    The two parameters specify how large the diameter of the fine patch should be compared to the
+    length of level 1. It is recommended to use at least ``1.5 1.5`` to include the corners.
+
 * ``mr_lev2.n_cell`` (2 `integer`)
     Number of cells in x and y for level 2.
     The number of cells in the zeta direction is calculated from ``patch_lo`` and ``patch_hi``.
@@ -235,6 +257,15 @@ Geometry
 
 * ``mr_lev2.patch_hi`` (3 `float`)
     Upper end of the refined grid in x, y and z.
+
+* ``mr_lev2.ref_ratio`` (2 `float`) optional (default `0 0`)
+    The refinement ratio of level 2 compared to level 0 in the x and y directions. If specified,
+    ``patch_lo`` and ``patch_hi`` will be adjusted by up to 5% to match the requested refinement ratio.
+
+* ``mr_lev2.plasma_fine_patch`` (2 `float`) optional (default `0 0`)
+    Enable a fine patch for all plasmas using the location and refinement ratio of level 2.
+    The two parameters specify how large the diameter of the fine patch should be compared to the
+    length of level 2. It is recommended to use at least ``1.5 1.5`` to include the corners.
 
 * ``lasers.n_cell`` (2 `integer`)
     Number of cells in x and y for the laser grid.
@@ -510,7 +541,9 @@ When both are specified, the per-species value is used.
 
 * ``<plasma name> or plasmas.fine_ppc`` (2 `int`) optional (default `0 0`)
     The number of plasma particles per cell in x and y inside the fine plasma patch. This must be
-    divisible by the ppc outside the fine patch in both directions.
+    divisible by the ppc outside the fine patch in both directions. The ppc number is taken relative
+    to the cell size of mesh refinement level 0 so it typically should be much larger than
+    ``<plasma name> or plasmas.ppc``.
 
 * ``<plasma name> or plasmas.fine_transition_cells`` (`int`) optional (default `5`)
     Number of cells that are used just outside of the fine plasma patch to smoothly transition
@@ -548,7 +581,7 @@ which are valid only for certain beam types, are introduced further below under
 
 * ``<beam name>.injection_type`` (`string`)
     The injection type for the particle beam. Currently available are ``fixed_weight_pdf``, ``fixed_weight``, ``fixed_ppc``,
-    and ``from_file``.
+    ``from_file`` and ``from_list``.
     ``fixed_weight_pdf`` generates a beam with a fixed number of particles with a constant weight where
     the transverse profile is Gaussian and the longitudinal profile is arbitrary according to a
     user-specified probability density function. It is more general and faster, and uses
@@ -557,6 +590,7 @@ which are valid only for certain beam types, are introduced further below under
     ``fixed_ppc`` generates a beam with a fixed number of particles per cell and
     varying weights. It can be either a Gaussian or a flattop beam.
     ``from_file`` reads a beam from openPMD files.
+    ``from_list`` reads a beam from arrays provided directly in the input script.
 
 * ``<beam name>.element`` (`string`) optional (default `electron`)
     The Physical Element of the plasma. Sets charge, mass and, if available,
@@ -611,6 +645,12 @@ which are valid only for certain beam types, are introduced further below under
 * ``<plasma name>.injection_product`` (`string`) optional (default "")
     Name of the beam species that contains the new electrons that are produced
     when this plasma gets ionized. Only needed if this plasma is ionizable and the laser injection is unabled.
+
+* ``<beam name> or beams.output_ratio`` (`int`) optional (default `1`)
+    Set the fraction of beam particles that should be written to the openPMD output.
+    For example, an output ratio of 100 will output every 100th beam particle.
+    This is implemented using the particle ID, which is set in ascending order at
+    the beginning of a simulation.
 
 Option: ``fixed_weight_pdf``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -824,6 +864,27 @@ Option: ``from_file``
     Whether to initialize the beam on the CPU instead of the GPU.
     Initializing the beam on the CPU can be much slower but is necessary if the full beam does not fit into GPU memory.
 
+Option: ``from_list``
+^^^^^^^^^^^^^^^^^^^^^
+
+* ``<beam name>.num_particles`` (`int`)
+    Number of particles to generate the beam. If this is equal to zero,
+    then the other parameters can be omitted.
+
+* ``<beam name>.init_pos_x``, ``<beam name>.init_pos_y`` and ``<beam name>.init_pos_z`` (`float`)
+    List of initial x-, y- and z-positions for all beam particles.
+
+* ``<beam name>.init_ux``, ``<beam name>.init_uy`` and ``<beam name>.init_uz`` (`float`)
+    List of initial normalized momentum (:math:`= \gamma \beta = \frac{p}{m c}`)
+    in x, y and z for all beam particles.
+
+* ``<beam name>.init_weight`` (`float`)
+    List of macro-particle weight for all beam particles.
+    A value of one corresponds to one physical particle.
+
+* ``<beam name>.init_sx``, ``<beam name>.init_sy`` and ``<beam name>.init_sz`` (`float`)
+    If spin-tracking is enabled, list of initial x-, y- and z-spin for all beam particles.
+
 SALAME algorithm
 ^^^^^^^^^^^^^^^^
 
@@ -861,7 +922,6 @@ For more information on the algorithm, see the corresponding publication `S. Die
 Laser parameters
 ----------------
 
-The laser profile is defined by :math:`a(x,y,z) = a_0 * \mathrm{exp}[-(x^2/w0_x^2 + y^2/w0_y^2 + z^2/L0^2)]`.
 The model implemented is the one from [C. Benedetti et al. Plasma Phys. Control. Fusion 60.1: 014002 (2017)].
 Unlike for ``beams`` and ``plasmas``, all the laser pulses are currently stored on the same array,
 which you can find in the output openPMD file as a complex array named `laserEnvelope`.
@@ -873,7 +933,7 @@ Parameters starting with ``lasers.`` apply to all laser pulses, parameters start
 
 * ``lasers.polarization`` (`linear` or `circular`) optional (default `linear`)
     Polarization of the laser pulse.
-    The ponderomotive force is 2x larger in circular polarization than in linear polarization.
+    For the same peak amplitude, the ponderomotive force is 2x larger in circular polarization than in linear polarization.
     Note that the envelope of the vector potential stored in arrays is independent on the polarization, such that the energy is actually 2x higher in circular polarization than in linear polarization.
 
 * ``lasers.use_phase`` (`bool`) optional (default `true`)
@@ -904,7 +964,7 @@ Parameters starting with ``lasers.`` apply to all laser pulses, parameters start
 * ``<laser name>.init_type`` (list of `string`) optional (default `gaussian`)
     The initialisation method of laser. Possible options are:
 
-      Option: ``gaussian`` (default) the laser is initialised with an ideal gaussian pulse.
+      ``gaussian`` (default): the laser is initialised with an ideal Gaussian pulse: :math:`a(x,y,z) = a_0 e^{-(x^2/w_0^2 + y^2/w_0^2 + z^2/L_0^2)}`.
 
       * ``<laser name>.a0`` (`float`) optional (default `0`)
           Peak normalized vector potential of the laser pulse.
@@ -931,7 +991,31 @@ Parameters starting with ``lasers.`` apply to all laser pulses, parameters start
       * ``<laser name>.propagation_angle_yz`` (`float`) optional (default `0`)
           Propagation angle of the pulse in the yz plane (0 is along the z axis)
 
-      Option: ``from_file`` the laser is loaded from an openPMD file.
+      * ``<laser name>.STC_theta_xy`` (`float`) optional (default `0`)
+          Direction of the linear spatial and angular chirps in the xy plane (in radians; `0` is along x, `π/2` along y).
+          In what follows, all chirps are given as defined in `S. Akturk et al., Optics Express 12, 4399 (2004) <https://doi.org/10.1364/OPEX.12.004399>`__.
+
+      * ``<laser name>.beta`` (`float`) optional (default `0.`)
+          Angular dispersion (or angular chirp) at focus in :math:`second`.
+
+      * ``<laser name>.zeta`` (`float`) optional (default `0.`)
+          Spatial chirp at focus in :math:`second \cdot meter`.
+
+      * ``<laser name>.phi2`` (`float`) optional (default `0`)
+          Temporal chirp :math:`\phi^{(2)}` at focus in :math:`second^2`.
+          Namely, a wave packet centered on frequency :math:`(\omega_0 + \delta \omega)` reaches its peak intensity at :math:`z(\delta \omega) = z_0 - c \phi^{(2)} \, \delta \omega`.
+          Thus, a positive :math:`\phi^{(2)}` corresponds to positive chirp, i.e., red part of the spectrum in the front of the pulse and blue part in the back.
+          More specifically, the electric field in the focal plane is of the form:
+
+          .. math::
+              E(\boldsymbol{x},t) \propto Re\left[ \exp\left(  -\frac{(t-t_{peak})^2}{\tau^2 + 2i\phi^{(2)}} + i\omega_0 (t-t_{peak}) + i\phi_0 \right) \right]
+
+          where :math:`\tau` is given by ``<laser_name>.tau`` and represents the Fourier-limited duration of the laser pulse. Thus, the actual duration of the chirped laser pulse is:
+
+          .. math::
+               \tau' = \sqrt{ \tau^2 + 4 (\phi^{(2)})^2/\tau^2 }
+
+      ``from_file``: the laser is loaded from an openPMD file.
 
       * ``<laser name>.input_file`` (`string`) optional (default `""`)
           Path to an openPMD file containing a laser envelope.
@@ -940,13 +1024,18 @@ Parameters starting with ``lasers.`` apply to all laser pulses, parameters start
           The laser pulse is injected in the HiPACE++ simulation so that the beginning of the temporal profile from the file corresponds to the head of the simulation box, and time (in the file) is converted to space (HiPACE++ longitudinal coordinate) with ``z = -c*t + const``.
           If this parameter is set, then the file is used to initialize all lasers instead of using a gaussian profile.
 
+      * ``<laser name>.lambda0`` (`float`) optional (default `<read from file>`)
+          Wavelength of the laser pulses. Currently, all pulses must have the same wavelength.
+          The wavelength is already read in from the metadata of the openPMD file,
+          however it can be overwritten using this parameter.
+
       * ``<laser name>.openPMD_laser_name`` (`string`) optional (default `laserEnvelope`)
           Name of the laser envelope field inside the openPMD file to be read in.
 
       * ``<laser name>.iteration`` (`int`) optional (default `0`)
           Iteration of the openPMD file to be read in.
 
-      Option: ``parser``, the laser is initialized with the expression of the complex envelope function.
+      ``parser``: the laser is initialized with the expression of the complex envelope function.
 
       * ``<laser name>.laser_real(x,y,z)`` optional (`string`) (default `""`)
           Expression for the real part of the laser envelope in `x, y, z`.
@@ -962,12 +1051,17 @@ Diagnostic parameters
 
 There are different types of diagnostics in HiPACE++. The standard diagnostics are compliant with the openPMD standard. The
 in-situ diagnostics allow for fast analysis of large beams or the plasma particles.
+Please make sure to always clear or rename the output folder before running a new simulation to avoid mixing data from different runs.
 
 * ``diagnostic.output_period`` (`integer`) optional (default `0`)
     Output period for standard beam and field diagnostics. Field or beam specific diagnostics can overwrite this parameter.
     No output is given for ``diagnostic.output_period = 0``.
 
-* ``hipace.file_prefix`` (`string`) optional (default `diags/hdf5/`)
+* ``hipace.output_folder`` (`string`) optional (default ``"diags"``)
+    Set the output path of diagnostic data. By default all types of diagnostics will output
+    into subfolders of this folder.
+
+* ``hipace.file_prefix`` (`string`) optional (default ``"<hipace.output_folder>/hdf5/"``)
     Path of the output.
 
 * ``hipace.openpmd_backend`` (`string`) optional (default `h5`)
@@ -1001,7 +1095,7 @@ Field diagnostics
     Available geometries are `level_0`, `level_1`, `level_2` and `laser`,
     depending on if MR or a laser is used.
     If ``<diag name>`` is equal to ``lev0 lev1 lev2 laser_diag``, the default for this parameter
-    becomes ``level_0 level_1 level_2 laser``respectively.
+    becomes ``level_0 level_1 level_2 laser`` respectively.
 
 * ``<diag name>.output_period`` (`integer`) optional (default `0`)
     Output period for fields. No output is given for ``<diag name>.output_period = 0``.
@@ -1025,21 +1119,20 @@ Field diagnostics
     Whether the field diagnostics should include ghost cells.
 
 * ``<diag name> or diagnostic.field_data`` (`string`) optional (default `all`)
-    Names of the fields written to file, separated by a space. The field names need to be ``all``,
-    ``none`` or a subset of ``ExmBy EypBx Ez Bx By Bz Psi``. For the predictor-corrector solver,
-    additionally ``jx jy jz rhomjz`` are available, which are the current and charge densities of the
-    plasma and the beam, with ``rhomjz`` equal to :math:`\rho-j_z/c`.
-    For the explicit solver, the current and charge densities of the beam and
-    for all plasmas are separated: ``jx_beam jy_beam jz_beam`` and ``jx jy rhomjz`` are available.
-    If ``rho`` is explicitly mentioned as ``field_data``, it is deposited by the plasma
-    to be available as a diagnostic. Similarly if ``rho_<plasma name>`` is explicitly mentioned,
-    the charge density of that plasma species will be separately available as a diagnostic.
-    When a laser pulse is used, the laser complex envelope ``laserEnvelope`` is available
-    in the ``laser`` base geometry.
-    The plasma proper density (n/gamma) is then also accessible via ``chi``.
-    A field can be removed from the list, for example, after it has been included through ``all``,
-    by adding ``remove_<field name>`` after it has been added. If a field is added and removed
-    multiple times, the last occurrence takes precedence.
+    Specifies the fields to be written to file, separated by a space. The field names can be:
+
+    * ``all``: Includes all available fields.
+    * ``none``: Excludes all fields.
+    * A subset of the following: ``Ex``, ``ExmBy``, ``Ey``, ``EypBx``, ``Ez``, ``Bx``, ``By``, ``Bz``, ``Psi``.
+    * Specific to the Predictor-Corrector solver: ``jx``, ``jy``, ``jz``, and ``rhomjz``, which correspond to the current and charge densities of the plasma and beam (``rhomjz`` is defined as :math:`\rho-j_z/c`).
+    * Specific to the Explicit solver: separate current and charge densities for the beam (``jx_beam``, ``jy_beam``, ``jz_beam``) and plasma (``jx``, ``jy``, and ``rhomjz``).
+    * Plasma diagnostics: ``rho`` (total charge density) is always available. Per-species diagnostics are also available: ``rho_<plasma name>`` (charge density of the species); ``w_<plasma name>`` (particle weights of the species); and momentum components ``ux_<plasma name>``, ``uy_<plasma name>``, ``uz_<plasma name>``, ``ux^2_<plasma name>``, etc.
+    * Laser diagnostics, when a laser pulse is used: ``laserEnvelope`` (the complex envelope of the
+      laser in the ``laser`` base geometry) and ``chi`` (plasma proper density :math:`n/\gamma`).
+      ``laserChi`` can be used to access chi on the laser grid, with the imaginary component
+      containing chi of the initial unperturbed plasma. ``|a^2|`` contains the absolute value
+      squared of the laser envelope in the real component and zero in the imaginary component.
+    * Fields can be added or removed from the list dynamically: to remove a field after including ``all``, use ``remove_<field name>``. If a field is added and removed multiple times, the last occurrence takes precedence.
 
 * ``<diag name> or diagnostic.patch_lo`` (3 `float`) optional (default `-infinity -infinity -infinity`)
     Lower limit for the diagnostic grid.
@@ -1053,9 +1146,14 @@ Field diagnostics
     If ``rho`` is explicitly mentioned in ``diagnostic.field_data``, then the default will become `1`.
 
 * ``hipace.deposit_rho_individual`` (`bool`) optional (default `0`)
-    This option works similar to ``hipace.deposit_rho``,
-    however the charge density from every plasma species will be deposited into individual fields
-    that are accessible as ``rho_<plasma name>`` in ``diagnostic.field_data``.
+    This option works similarly to ``hipace.deposit_rho``,
+    but the charge density from every plasma species will be deposited into individual fields
+    accessible as ``rho_<plasma name>`` in ``diagnostic.field_data``.
+
+* ``hipace.deposit_temp_individual`` (`bool`) optional (default `0`)
+    The weights, momentum, and their squares from every plasma species
+    will be deposited into individual fields accessible as ``w``, ``ux_<plasma name>`` or
+    ``ux^2_<plasma name>`` (similarly for ``uy`` and ``uz``) in ``diagnostic.field_data``.
 
 In-situ diagnostics
 ^^^^^^^^^^^^^^^^^^^
@@ -1079,7 +1177,7 @@ For the field in-situ diagnostics, the following quantities are calculated per s
 These quantities can be used to calculate the energy stored in the fields.
 
 For the laser in-situ diagnostics, the following quantities are calculated per slice and stored:
-``max(|a|^2), [|a|^2], [|a|^2*x], [|a|^2*x*x], [|a|^2*y], [|a|^2*y*y], axis(a)``.
+``max(|a|^2), [|a|^2], [|a|^2*x], [|a|^2*x*x], [|a|^2*y], [|a|^2*y*y], axis(a), [chi*d_z|a|^2]``.
 Thereby, ``max(|a|^2)`` is the highest value of ``|a|^2`` in the current slice
 and ``axis(a)`` gives the complex value of the laser envelope, in the center of every slice.
 
@@ -1102,12 +1200,25 @@ When this is parsed into Python it can be converted to a NumPy structured dataty
 The rest of the file, following immediately after the closing ``}``, is in binary format and
 contains all of the in-situ diagnostics along with some metadata. This part can be read using the
 structured datatype of the first section.
-Use ``hipace/tools/read_insitu_diagnostics.py`` to read the files using this format. Functions to calculate the most useful properties are also provided in that file.
+Use ``hipace/tools/read_insitu_diagnostics.py`` to read the files using this format.
+It can be installed using the command ``pip install -U -e /path_to_hipace/hipace/tools``.
+Functions to calculate the most useful properties are also provided in that file.
+Usage example:
+
+.. code-block:: python
+
+    import read_insitu_diagnostics as diag
+    ir = diag.InSituReader("diags/insitu/reduced_beam.*.txt")
+    ir.avail() # print available quantities
+    ir.avg_data("[x]") # get 1D array over time steps
+    ir.slice_data("emittance_x") # get 2D array over time steps and slices
+    ir.time, ir.zeta # get metadata needed for plotting
+
 
 * ``<beam name> or beams.insitu_period`` (`int`) optional (default ``0``)
     Period of the beam in-situ diagnostics. `0` means no beam in-situ diagnostics.
 
-* ``<beam name> or beams.insitu_file_prefix`` (`string`) optional (default ``"diags/insitu"``)
+* ``<beam name> or beams.insitu_file_prefix`` (`string`) optional (default ``"<hipace.output_folder>/insitu"``)
     Path of the beam in-situ output. Must not be the same as `hipace.file_prefix`.
 
 * ``<beam name> or beams.insitu_radius`` (`float`) optional (default ``infinity``)
@@ -1117,7 +1228,7 @@ Use ``hipace/tools/read_insitu_diagnostics.py`` to read the files using this for
 * ``<plasma name> or plasmas.insitu_period`` (`int`) optional (default ``0``)
     Period of the plasma in-situ diagnostics. `0` means no plasma in-situ diagnostics.
 
-* ``<plasma name> or plasmas.insitu_file_prefix`` (`string`) optional (default ``"plasma_diags/insitu"``)
+* ``<plasma name> or plasmas.insitu_file_prefix`` (`string`) optional (default ``"<hipace.output_folder>/insitu"``)
     Path of the plasma in-situ output. Must not be the same as `hipace.file_prefix`.
 
 * ``<plasma name> or plasmas.insitu_radius`` (`float`) optional (default ``infinity``)
@@ -1127,13 +1238,13 @@ Use ``hipace/tools/read_insitu_diagnostics.py`` to read the files using this for
 * ``fields.insitu_period`` (`int`) optional (default ``0``)
     Period of the field in-situ diagnostics. `0` means no field in-situ diagnostics.
 
-* ``fields.insitu_file_prefix`` (`string`) optional (default ``"diags/field_insitu"``)
+* ``fields.insitu_file_prefix`` (`string`) optional (default ``"<hipace.output_folder>/insitu"``)
     Path of the field in-situ output. Must not be the same as `hipace.file_prefix`.
 
 * ``lasers.insitu_period`` (`int`) optional (default ``0``)
     Period of the laser in-situ diagnostics. `0` means no laser in-situ diagnostics.
 
-* ``lasers.insitu_file_prefix`` (`string`) optional (default ``"diags/laser_insitu"``)
+* ``lasers.insitu_file_prefix`` (`string`) optional (default ``"<hipace.output_folder>/insitu"``)
     Path of the laser in-situ output. Must not be the same as `hipace.file_prefix`.
 
 Additional physics

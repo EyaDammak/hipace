@@ -19,7 +19,7 @@
 void
 AdvanceBeamParticlesSlice (
     BeamParticleContainer& beam, const Fields& fields, amrex::Vector<amrex::Geometry> const& gm,
-    const int slice, int const current_N_level)
+    const int slice, int const current_N_level, int step)
 {
     HIPACE_PROFILE("AdvanceBeamParticlesSlice()");
     using namespace amrex::literals;
@@ -27,26 +27,22 @@ AdvanceBeamParticlesSlice (
     const PhysConst phys_const = get_phys_const();
 
     const bool do_z_push = beam.m_do_z_push;
-    const int n_subcycles = beam.m_n_subcycles;
+    const amrex::Real n_subcycles = static_cast<amrex::Real>(beam.m_n_subcycles);
     const bool radiation_reaction = beam.m_do_radiation_reaction;
     const amrex::Real time = Hipace::GetInstance().m_physical_time;
-    const amrex::Real dt = Hipace::GetInstance().m_dt / n_subcycles;
-    const amrex::Real background_density_SI = Hipace::m_background_density_SI;
-    const bool normalized_units = Hipace::m_normalized_units;
+    const amrex::Real max_dt = Hipace::GetInstance().m_dt / n_subcycles;
     const bool spin_tracking = beam.m_do_spin_tracking;
     const amrex::Real spin_anom = beam.m_spin_anom;
-
-    if (normalized_units && radiation_reaction) {
-        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(background_density_SI!=0,
-            "For radiation reactions with normalized units, a background plasma density != 0 must "
-            "be specified via 'hipace.background_density_SI'");
-    }
 
     const int psi_comp = Comps[WhichSlice::This]["Psi"];
     const int ez_comp = Comps[WhichSlice::This]["Ez"];
     const int bx_comp = Comps[WhichSlice::This]["Bx"];
     const int by_comp = Comps[WhichSlice::This]["By"];
     const int bz_comp = Comps[WhichSlice::This]["Bz"];
+
+    const bool do_ez_inzerp = (Hipace::m_depos_order_z == 2);
+    const int ez_comp_prev = do_ez_inzerp ? Comps[WhichSlice::Previous]["Ez"] : -1;
+    const int ez_comp_next = do_ez_inzerp ? Comps[WhichSlice::Next]["Ez"] : -1;
 
     const int lev0_idx = 0;
     const int lev1_idx = std::min(1, current_N_level-1);
@@ -81,6 +77,9 @@ AdvanceBeamParticlesSlice (
     const amrex::Real y_pos_offset_lev1 = GetPosOffset(1, gm[lev1_idx], slice_fab_lev1.box());
     const amrex::Real y_pos_offset_lev2 = GetPosOffset(1, gm[lev2_idx], slice_fab_lev2.box());
 
+    // z is the same for all levels
+    amrex::Real const dz_inv = gm[lev0_idx].InvCellSize(2);
+
     const CheckDomainBounds lev1_bounds {gm[lev1_idx]};
     const CheckDomainBounds lev2_bounds {gm[lev2_idx]};
 
@@ -91,41 +90,41 @@ AdvanceBeamParticlesSlice (
 
     const amrex::Real clight = phys_const.c;
     const amrex::Real inv_clight = 1.0_rt/phys_const.c;
-    const amrex::Real inv_clight_SI = 1.0_rt/PhysConstSI::c;
-    const amrex::Real inv_c2 = 1.0_rt/(phys_const.c*phys_const.c);
     const amrex::Real charge_mass_ratio = beam.m_charge / beam.m_mass;
     const amrex::Real min_z = gm[0].ProbLo(2) + (slice-gm[0].Domain().smallEnd(2))*gm[0].CellSize(2);
     bool use_external_fields = beam.m_use_external_fields;
     auto external_fields = beam.m_external_fields;
 
     // Radiation reaction constant
-    const amrex::ParticleReal q_over_mc = normalized_units ?
-                                  charge_mass_ratio/PhysConstSI::c*PhysConstSI::q_e/PhysConstSI::m_e
-                                : charge_mass_ratio/PhysConstSI::c;
-    const amrex::ParticleReal RRcoeff = (2.0_rt/3.0_rt)*PhysConstSI::r_e*q_over_mc*q_over_mc;
-
-    // calcuation of E0 in SI units for denormalization
-    // using wp_inv to avoid multiplication in kernel
-    const amrex::Real wp_inv = normalized_units ? std::sqrt(PhysConstSI::ep0 * PhysConstSI::m_e/
-                                     ( static_cast<double>(background_density_SI) *
-                                     PhysConstSI::q_e*PhysConstSI::q_e )  ) : 1;
-    const amrex::Real E0 = Hipace::m_normalized_units ?
-                           PhysConstSI::m_e * PhysConstSI::c / wp_inv / PhysConstSI::q_e : 1;
+    amrex::Real rr_factor = (2.0_rt/3.0_rt) * PhysConstSI::r_e
+        * charge_mass_ratio * charge_mass_ratio / PhysConstSI::c;
+    if (Hipace::m_normalized_units && radiation_reaction) {
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(Hipace::m_background_density_SI != 0,
+            "For radiation reactions with normalized units, a background plasma density != 0 must "
+            "be specified via 'hipace.background_density_SI'");
+        rr_factor *= std::sqrt(static_cast<double>(Hipace::m_background_density_SI)
+                / (PhysConstSI::ep0 * PhysConstSI::m_e)) * PhysConstSI::q_e;
+    }
 
     // don't include slipped particles in count as they were already pushed
     Hipace::m_num_beam_particles_pushed += double(beam.getNumParticles(WhichBeamSlice::This));
+
+    const int num_non_slipped = step == 0 ? 0 : beam.getNumParticles(WhichBeamSlice::This);
 
     // Use OMP ParallelFor to use multiple threads when running on CPU
     omp::ParallelFor(
         amrex::TypeList<
             amrex::CompileTimeOptions<0, 1, 2, 3>,
+            amrex::CompileTimeOptions<false, true>,
             amrex::CompileTimeOptions<false, true>
         >{}, {
             Hipace::m_depos_order_xy,
-            use_external_fields
+            use_external_fields,
+            do_ez_inzerp
         },
         beam.getNumParticlesIncludingSlipped(WhichBeamSlice::This),
-        [=] AMREX_GPU_DEVICE (int ip, auto depos_order, auto c_use_external_fields) {
+        [=] AMREX_GPU_DEVICE (int ip, auto depos_order, auto c_use_external_fields,
+                              auto c_do_ez_inzerp) {
 
             if (!ptd.id(ip).is_valid()) return;
 
@@ -136,7 +135,12 @@ AdvanceBeamParticlesSlice (
             amrex::Real uy = ptd.rdata(BeamIdx::uy)[ip];
             amrex::Real uz = ptd.rdata(BeamIdx::uz)[ip];
 
-            int i = ptd.idata(BeamIdx::nsubcycles)[ip];
+            amrex::Real i_subcycle = ptd.rdata(BeamIdx::nsubcycles)[ip];
+
+            if (ip < num_non_slipped) {
+                // new time step
+                i_subcycle -= n_subcycles;
+            }
 
             amrex::RealVect spin {0._rt, 0._rt, 0._rt};
             if (spin_tracking) {
@@ -145,20 +149,28 @@ AdvanceBeamParticlesSlice (
                 spin[2] = ptd.m_runtime_rdata[2][ip];
             }
 
-            for (; i < n_subcycles; i++) {
+            while (i_subcycle < n_subcycles) {
 
                 if (zp < min_z) {
                     // stop pushing particle if it is not on this slice anymore
                     break;
                 }
 
+                i_subcycle += 1._rt;
+
+                amrex::Real dt = max_dt;
+                if (i_subcycle >= n_subcycles) {
+                    dt *= n_subcycles - i_subcycle + 1._rt;
+                    i_subcycle = n_subcycles;
+                }
+
                 const amrex::ParticleReal gammap_inv = 1._rt / std::sqrt( 1._rt
-                    + (ux*ux + uy*uy + uz*uz)*inv_c2 );
+                    + ux*ux + uy*uy + uz*uz);
 
                 // first we do half a step in x,y
                 // This is not required in z, which is pushed in one step later
-                xp += dt * 0.5_rt * ux * gammap_inv;
-                yp += dt * 0.5_rt * uy * gammap_inv;
+                xp += dt * clight * 0.5_rt * gammap_inv * ux;
+                yp += dt * clight * 0.5_rt * gammap_inv * uy;
 
                 if (enforceBC(ptd, ip, xp, yp, ux, uy, BeamIdx::w)) return;
 
@@ -193,16 +205,48 @@ AdvanceBeamParticlesSlice (
                     slice_arr, psi_comp, ez_comp, bx_comp, by_comp, bz_comp,
                     dx_inv, dy_inv, x_pos_offset, y_pos_offset);
 
+                if (c_do_ez_inzerp.value) {
+                    // x,y,z direction
+                    const amrex::Real xmid = (xp-x_pos_offset)*dx_inv;
+                    const amrex::Real ymid = (yp-y_pos_offset)*dy_inv;
+                    const amrex::Real zmid = (zp-min_z)*dz_inv-0.5_rt;
+
+                    auto [shape_p, pcell] =
+                        compute_single_shape_factor<false, 2>(zmid, 2);
+                    auto [shape_n, ncell] =
+                        compute_single_shape_factor<false, 2>(zmid, 0);
+
+                    Ezp *= (1._rt - shape_p - shape_n);
+
+                    // Gather Ez field on particle from grid
+                    for (int iy=0; iy<=depos_order.value; iy++){
+                        for (int ix=0; ix<=depos_order.value; ix++){
+                            // Compute shape factors
+                            auto [shape_y, jcell] =
+                                compute_single_shape_factor<false, depos_order.value>(ymid, iy);
+                            auto [shape_x, icell] =
+                                compute_single_shape_factor<false, depos_order.value>(xmid, ix);
+
+                            Ezp += shape_p * shape_y * shape_x * slice_arr(icell, jcell, ez_comp_prev);
+                            Ezp += shape_n * shape_y * shape_x * slice_arr(icell, jcell, ez_comp_next);
+                        }
+                    }
+                }
+
                 if (c_use_external_fields.value) {
                     ApplyExternalField(xp, yp, zp, time, clight, ExmByp, EypBxp, Ezp, Bxp, Byp, Bzp,
                         external_fields);
                 }
 
+                ExmByp *= inv_clight;
+                EypBxp *= inv_clight;
+                Ezp *= inv_clight;
+
                 // use intermediate fields to calculate next (n+1) transverse momenta
                 amrex::ParticleReal ux_next = ux + dt * charge_mass_ratio
-                    * ( ExmByp + ( clight - uz * gammap_inv ) * Byp + uy*gammap_inv*Bzp);
+                    * ( ExmByp + ( 1._rt - uz * gammap_inv ) * Byp + uy * gammap_inv * Bzp);
                 amrex::ParticleReal uy_next = uy + dt * charge_mass_ratio
-                    * ( EypBxp + ( uz * gammap_inv - clight ) * Bxp - ux*gammap_inv*Bzp);
+                    * ( EypBxp - ( 1._rt - uz * gammap_inv ) * Bxp - ux * gammap_inv * Bzp);
 
                 // Now computing new longitudinal momentum
                 const amrex::ParticleReal ux_intermediate = ( ux_next + ux ) * 0.5_rt;
@@ -211,23 +255,22 @@ AdvanceBeamParticlesSlice (
                     + dt * 0.5_rt * charge_mass_ratio * Ezp;
 
                 const amrex::ParticleReal gamma_intermediate_inv = 1._rt / std::sqrt( 1._rt
-                    + ( ux_intermediate*ux_intermediate
-                       + uy_intermediate*uy_intermediate
-                       + uz_intermediate*uz_intermediate )*inv_c2 );
+                    + ux_intermediate*ux_intermediate
+                    + uy_intermediate*uy_intermediate
+                    + uz_intermediate*uz_intermediate);
 
                 if (spin_tracking) {
-                    const amrex::RealVect E {ExmByp + clight*Byp, EypBxp - clight*Bxp, Ezp};
+                    const amrex::RealVect E {ExmByp + Byp, EypBxp - Bxp, Ezp};
                     const amrex::RealVect B {Bxp, Byp, Bzp};
-                    const amrex::RealVect u {ux_intermediate*inv_clight, uy_intermediate*inv_clight,
-                                             uz_intermediate*inv_clight};
+                    const amrex::RealVect u {ux_intermediate, uy_intermediate, uz_intermediate};
                     const amrex::RealVect beta = u*gamma_intermediate_inv;
                     const amrex::Real gamma_inv_p1 =
                         gamma_intermediate_inv / (1._rt + gamma_intermediate_inv);
 
                     const amrex::RealVect omega = std::abs(charge_mass_ratio) * (
-                        B * gamma_intermediate_inv - beta.crossProduct(E) * inv_clight * gamma_inv_p1
+                        B * gamma_intermediate_inv - beta.crossProduct(E) * gamma_inv_p1
                         + spin_anom * (
-                            B - gamma_inv_p1 * u * beta.dotProduct(B) - beta.crossProduct(E) * inv_clight
+                            B - gamma_inv_p1 * u * beta.dotProduct(B) - beta.crossProduct(E)
                         )
                     );
 
@@ -242,39 +285,23 @@ AdvanceBeamParticlesSlice (
                     * gamma_intermediate_inv );
 
                 if (radiation_reaction) {
+                    const amrex::ParticleReal Exp = ExmByp + Byp;
+                    const amrex::ParticleReal Eyp = EypBxp - Bxp;
 
-                    amrex::ParticleReal Exp = ExmByp + clight*Byp;
-                    amrex::ParticleReal Eyp = EypBxp - clight*Bxp;
-
-                    // convert to SI units, no backwards conversion as not used after RR calculation
-                    if (normalized_units) {
-                        Exp *= E0;
-                        Eyp *= E0;
-                        Ezp *= E0;
-                        Bxp *= E0*inv_clight_SI;
-                        Byp *= E0*inv_clight_SI;
-                        Bzp *= E0*inv_clight_SI;
-                    }
                     const amrex::ParticleReal gamma_intermediate = std::sqrt(
-                        1._rt + ( ux_intermediate*ux_intermediate
-                                 + uy_intermediate*uy_intermediate
-                                 + uz_intermediate*uz_intermediate )*inv_c2 );
-                    // Estimation of the velocity at intermediate time
-                    const amrex::ParticleReal vx_n = ux_intermediate*gamma_intermediate_inv
-                                                     *PhysConstSI::c*inv_clight;
-                    const amrex::ParticleReal vy_n = uy_intermediate*gamma_intermediate_inv
-                                                     *PhysConstSI::c*inv_clight;
-                    const amrex::ParticleReal vz_n = uz_intermediate*gamma_intermediate_inv
-                                                     *PhysConstSI::c*inv_clight;
-                    // Normalized velocity beta (v/c)
-                    const amrex::ParticleReal bx_n = vx_n*inv_clight_SI;
-                    const amrex::ParticleReal by_n = vy_n*inv_clight_SI;
-                    const amrex::ParticleReal bz_n = vz_n*inv_clight_SI;
+                        1._rt + ux_intermediate*ux_intermediate
+                              + uy_intermediate*uy_intermediate
+                              + uz_intermediate*uz_intermediate);
+
+                    // Estimation of normalized velocity beta (v/c) at intermediate time
+                    const amrex::ParticleReal bx_n = ux_intermediate * gamma_intermediate_inv;
+                    const amrex::ParticleReal by_n = uy_intermediate * gamma_intermediate_inv;
+                    const amrex::ParticleReal bz_n = uz_intermediate * gamma_intermediate_inv;
 
                     // Lorentz force over charge
-                    const amrex::ParticleReal flx_q = (Exp + vy_n*Bzp - vz_n*Byp);
-                    const amrex::ParticleReal fly_q = (Eyp + vz_n*Bxp - vx_n*Bzp);
-                    const amrex::ParticleReal flz_q = (Ezp + vx_n*Byp - vy_n*Bxp);
+                    const amrex::ParticleReal flx_q = (Exp + by_n*Bzp - bz_n*Byp);
+                    const amrex::ParticleReal fly_q = (Eyp + bz_n*Bxp - bx_n*Bzp);
+                    const amrex::ParticleReal flz_q = (Ezp + bx_n*Byp - by_n*Bxp);
                     const amrex::ParticleReal fl_q2 = flx_q*flx_q + fly_q*fly_q + flz_q*flz_q;
 
                     // Calculation of auxiliary quantities
@@ -282,27 +309,22 @@ AdvanceBeamParticlesSlice (
                     const amrex::ParticleReal bdotE2 = bdotE*bdotE;
                     const amrex::ParticleReal coeff = gamma_intermediate*gamma_intermediate*(fl_q2-bdotE2);
 
-                    //Compute the components of the RR force
-                    const amrex::ParticleReal frx =
-                        RRcoeff*(PhysConstSI::c*(fly_q*Bzp - flz_q*Byp) + bdotE*Exp - coeff*bx_n);
-                    const amrex::ParticleReal fry =
-                        RRcoeff*(PhysConstSI::c*(flz_q*Bxp - flx_q*Bzp) + bdotE*Eyp - coeff*by_n);
-                    const amrex::ParticleReal frz =
-                        RRcoeff*(PhysConstSI::c*(flx_q*Byp - fly_q*Bxp) + bdotE*Ezp - coeff*bz_n);
+                    // Compute the components of the RR force
+                    const amrex::ParticleReal frx = fly_q*Bzp - flz_q*Byp + bdotE*Exp - coeff*bx_n;
+                    const amrex::ParticleReal fry = flz_q*Bxp - flx_q*Bzp + bdotE*Eyp - coeff*by_n;
+                    const amrex::ParticleReal frz = flx_q*Byp - fly_q*Bxp + bdotE*Ezp - coeff*bz_n;
 
-                    //Update momentum using the RR force
-                    // in normalized units wp_inv normalizes the time step
-                    // *clight/inv_clight_SI converts to proper velocity
-                    ux_next += frx*dt*wp_inv*clight*inv_clight_SI;
-                    uy_next += fry*dt*wp_inv*clight*inv_clight_SI;
-                    uz_next += frz*dt*wp_inv*clight*inv_clight_SI;
+                    // Update momentum using the RR force
+                    ux_next += dt * rr_factor * frx;
+                    uy_next += dt * rr_factor * fry;
+                    uz_next += dt * rr_factor * frz;
                 }
 
                 /* computing next gamma value */
                 const amrex::ParticleReal gamma_next_inv = 1._rt / std::sqrt( 1._rt
-                    + ( ux_next*ux_next
-                       + uy_next*uy_next
-                       + uz_next*uz_next )*inv_c2 );
+                    + ux_next*ux_next
+                    + uy_next*uy_next
+                    + uz_next*uz_next);
 
                 /*
                  * computing positions and setting momenta for the next timestep
@@ -311,9 +333,9 @@ AdvanceBeamParticlesSlice (
                  * first-order (i.e. without the intermediary half-step) using
                  * a simple Galilean transformation
                  */
-                xp += dt * 0.5_rt * ux_next * gamma_next_inv;
-                yp += dt * 0.5_rt * uy_next * gamma_next_inv;
-                if (do_z_push) zp += dt * ( uz_next * gamma_next_inv - clight );
+                xp += dt * clight * 0.5_rt * gamma_next_inv * ux_next;
+                yp += dt * clight * 0.5_rt * gamma_next_inv * uy_next;
+                if (do_z_push) zp += dt * clight * ( uz_next * gamma_next_inv - 1._rt );
                 ux = ux_next;
                 uy = uy_next;
                 uz = uz_next;
@@ -322,7 +344,7 @@ AdvanceBeamParticlesSlice (
             ptd.pos(0, ip) = xp;
             ptd.pos(1, ip) = yp;
             ptd.pos(2, ip) = zp;
-            ptd.idata(BeamIdx::nsubcycles)[ip] = i;
+            ptd.rdata(BeamIdx::nsubcycles)[ip] = i_subcycle;
             ptd.rdata(BeamIdx::ux)[ip] = ux;
             ptd.rdata(BeamIdx::uy)[ip] = uy;
             ptd.rdata(BeamIdx::uz)[ip] = uz;

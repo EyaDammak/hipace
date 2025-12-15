@@ -24,10 +24,11 @@ InitParticles (const amrex::RealVect& a_u_std,
     HIPACE_PROFILE("PlasmaParticleContainer::InitParticles()");
     using namespace amrex::literals;
     clearParticles();
-    const int lev = 0;
-    const auto dx = ParticleGeom(lev).CellSizeArray();
-    const auto plo = ParticleGeom(lev).ProbLoArray();
-    amrex::RealBox a_bounds = ParticleGeom(lev).ProbDomain();
+    constexpr int n_lev = 3;
+    constexpr int max_lev = n_lev - 1;
+    const auto dx = ParticleGeom(0).CellSizeArray();
+    const auto plo = ParticleGeom(0).ProbLoArray();
+    amrex::RealBox a_bounds = ParticleGeom(0).ProbDomain();
     a_bounds.setLo(0, Hipace::m_boundary_particle_lo[0]);
     a_bounds.setLo(1, Hipace::m_boundary_particle_lo[1]);
     a_bounds.setHi(0, Hipace::m_boundary_particle_hi[0]);
@@ -35,14 +36,25 @@ InitParticles (const amrex::RealVect& a_u_std,
 
     const bool use_fine_patch = m_use_fine_patch;
 
-    const amrex::Array<int, 2> ppc_coarse = m_ppc;
-    const int num_ppc_coarse = ppc_coarse[0] * ppc_coarse[1];
-    amrex::Real scale_fac_coarse = num_ppc_coarse <= 0 ? 0. :
-        (Hipace::m_normalized_units ? 1./num_ppc_coarse : dx[0]*dx[1]*dx[2]/num_ppc_coarse);
-    const amrex::Array<int, 2> ppc_fine = m_ppc_fine;
-    const int num_ppc_fine = ppc_fine[0] * ppc_fine[1];
-    amrex::Real scale_fac_fine = num_ppc_fine <= 0 ? 0. :
-        (Hipace::m_normalized_units ? 1./num_ppc_fine : dx[0]*dx[1]*dx[2]/num_ppc_fine);
+    amrex::Array<amrex::Array<int, std::size_t{2ul}>, std::size_t{n_lev}> ppc_lev {};
+    ppc_lev[0] = m_ppc;
+
+    ppc_lev[1] = m_ppc_fine;
+    ppc_lev[1][0] = std::max(ppc_lev[1][0], ppc_lev[0][0]);
+    ppc_lev[1][1] = std::max(ppc_lev[1][1], ppc_lev[0][1]);
+
+    ppc_lev[2] = m_ppc_fine2;
+    ppc_lev[2][0] = std::max(ppc_lev[2][0], ppc_lev[1][0]);
+    ppc_lev[2][1] = std::max(ppc_lev[2][1], ppc_lev[1][1]);
+
+    const int max_ppc = ppc_lev[2][0] * ppc_lev[2][1];
+
+    amrex::Array<amrex::Real, n_lev> scale_fac_lev {};
+    for (int lev = 0; lev < n_lev; ++lev) {
+        const int num_ppc = ppc_lev[lev][0] * ppc_lev[lev][1];
+        scale_fac_lev[lev] = num_ppc <= 0 ? 0. :
+            (Hipace::m_normalized_units ? 1./num_ppc : dx[0]*dx[1]*dx[2]/num_ppc);
+    }
 
     amrex::IntVect box_nodal{amrex::IndexType::CELL,amrex::IndexType::CELL,amrex::IndexType::CELL};
     amrex::IntVect box_grow{0, 0, 0};
@@ -50,24 +62,24 @@ InitParticles (const amrex::RealVect& a_u_std,
     amrex::Real y_offset = 0._rt;
 
     if (m_prevent_centered_particle) {
-        if (ParticleGeom(lev).Domain().length(0) % 2 == 1 && ppc_coarse[0] % 2 == 1) {
+        if (ParticleGeom(0).Domain().length(0) % 2 == 1 && ppc_lev[0][0] % 2 == 1) {
             box_nodal[0] = amrex::IndexType::NODE;
             box_grow[0] = -1;
             x_offset = -0.5_rt;
         }
 
-        if (ParticleGeom(lev).Domain().length(1) % 2 == 1 && ppc_coarse[1] % 2 == 1) {
+        if (ParticleGeom(0).Domain().length(1) % 2 == 1 && ppc_lev[0][1] % 2 == 1) {
             box_nodal[1] = amrex::IndexType::NODE;
             box_grow[1] = -1;
             y_offset = -0.5_rt;
         }
     }
 
-    for(amrex::MFIter mfi = MakeMFIter(lev, DfltMfi); mfi.isValid(); ++mfi)
+    for(amrex::MFIter mfi = MakeMFIter(0, DfltMfi); mfi.isValid(); ++mfi)
     {
         amrex::Box tile_box  = mfi.tilebox(box_nodal, box_grow);
 
-        if (a_radius != std::numeric_limits<amrex::Real>::infinity()) {
+        if (a_radius != std::numeric_limits<amrex::Real>::max()) {
             amrex::IntVect lo_limit {
                 static_cast<int>(std::round((-a_radius - plo[0])/dx[0] - 2)),
                 static_cast<int>(std::round((-a_radius - plo[1])/dx[1] - 2)),
@@ -80,6 +92,9 @@ InitParticles (const amrex::RealVect& a_u_std,
             };
             tile_box &= amrex::Box(lo_limit, hi_limit, box_nodal);
         }
+
+        const amrex::Real radius_sq = a_radius == std::numeric_limits<amrex::Real>::max() ?
+            std::numeric_limits<amrex::Real>::max() : a_radius * a_radius;
 
         const auto lo = amrex::lbound(tile_box);
         const auto hi = amrex::ubound(tile_box);
@@ -107,14 +122,12 @@ InitParticles (const amrex::RealVect& a_u_std,
                 {
                     const amrex::Real x = plo[0] + (i + 0.5_rt + x_offset)*dx[0];
                     const amrex::Real y = plo[1] + (j + 0.5_rt + y_offset)*dx[1];
-                    if (fine_patch_func(x, y) > 0) {
-                        arr_fine(i, j, comp_a) = fine_transition_cells + 1;
-                    } else {
-                        arr_fine(i, j, comp_a) = 0;
-                    }
+                    const int fine_val = static_cast<int>(std::round(fine_patch_func(x, y)));
+                    arr_fine(i, j, comp_a) = std::min(max_lev+0, std::max(0, fine_val))
+                                             * (fine_transition_cells + 1);
                 });
 
-            for (int iter=0; iter<fine_transition_cells; ++iter) {
+            for (int iter=0; iter<max_lev*fine_transition_cells; ++iter) {
                 std::swap(comp_a, comp_b);
 
                 amrex::ParallelFor(to2D(tile_box),
@@ -145,12 +158,12 @@ InitParticles (const amrex::RealVect& a_u_std,
                 auto [i,j,k] = tile_box.atOffset3d(idx).arr;
 
                 amrex::Long num_particles_cell = 0;
-                for (int i_part=0; i_part<num_ppc_fine; ++i_part)
+                for (int i_part=0; i_part<max_ppc; ++i_part)
                 {
                     amrex::Real r[2];
                     bool do_init = false;
                     ParticleUtil::get_position_unit_cell_fine(r, do_init, i_part,
-                        ppc_coarse, ppc_fine, fine_transition_cells,
+                        ppc_lev, fine_transition_cells,
                         use_fine_patch ? arr_fine(i, j, comp_a) : 0);
 
                     if (!do_init) continue;
@@ -161,7 +174,7 @@ InitParticles (const amrex::RealVect& a_u_std,
                     const amrex::Real rsq = x*x + y*y;
                     if (x >= a_bounds.hi(0) || x < a_bounds.lo(0) ||
                         y >= a_bounds.hi(1) || y < a_bounds.lo(1) ||
-                        rsq > a_radius*a_radius ||
+                        rsq > radius_sq ||
                         rsq < a_hollow_core_radius*a_hollow_core_radius ||
                         density_func(x, y, c_t) <= min_density) continue;
 
@@ -172,11 +185,12 @@ InitParticles (const amrex::RealVect& a_u_std,
 
         if (m_do_symmetrize) {
             total_num_particles *= 4;
-            scale_fac_coarse /= 4.;
-            scale_fac_fine /= 4.;
+            for (int lev = 0; lev < n_lev; ++lev) {
+                scale_fac_lev[lev] /= 4.;
+            }
         }
 
-        auto& particles = GetParticles(lev);
+        auto& particles = GetParticles(0);
         auto& particle_tile = particles[std::make_pair(mfi.index(), mfi.LocalTileIndex())];
 
         auto old_size = particle_tile.size();
@@ -189,7 +203,7 @@ InitParticles (const amrex::RealVect& a_u_std,
         // The loop over particles is outside the loop over cells
         // so that particles in the same cell are far apart.
         // This makes current deposition faster.
-        for (int i_part=0; i_part<num_ppc_fine; ++i_part)
+        for (int i_part=0; i_part<max_ppc; ++i_part)
         {
             amrex::Gpu::DeviceVector<unsigned int> counts(tile_box.numPts(), 0);
             unsigned int* pcount = counts.dataPtr();
@@ -203,7 +217,7 @@ InitParticles (const amrex::RealVect& a_u_std,
                 amrex::Real r[2];
                 bool do_init = false;
                 ParticleUtil::get_position_unit_cell_fine(r, do_init, i_part,
-                    ppc_coarse, ppc_fine, fine_transition_cells,
+                    ppc_lev, fine_transition_cells,
                     use_fine_patch ? arr_fine(i, j, comp_a) : 0);
 
                 if (!do_init) return;
@@ -214,7 +228,7 @@ InitParticles (const amrex::RealVect& a_u_std,
                 const amrex::Real rsq = x*x + y*y;
                 if (x >= a_bounds.hi(0) || x < a_bounds.lo(0) ||
                     y >= a_bounds.hi(1) || y < a_bounds.lo(1) ||
-                    rsq > a_radius*a_radius ||
+                    rsq > radius_sq ||
                     rsq < a_hollow_core_radius*a_hollow_core_radius ||
                     density_func(x, y, c_t) <= min_density) return;
 
@@ -263,7 +277,7 @@ InitParticles (const amrex::RealVect& a_u_std,
                 amrex::Real r[2] = {0.,0.};
                 bool do_init = false;
                 ParticleUtil::get_position_unit_cell_fine(r, do_init, i_part,
-                    ppc_coarse, ppc_fine, fine_transition_cells,
+                    ppc_lev, fine_transition_cells,
                     use_fine_patch ? arr_fine(i, j, comp_a) : 0);
 
                 if (!do_init) return;
@@ -271,12 +285,14 @@ InitParticles (const amrex::RealVect& a_u_std,
                 amrex::Real x = plo[0] + (i + r[0] + x_offset)*dx[0];
                 amrex::Real y = plo[1] + (j + r[1] + y_offset)*dx[1];
 
+                const amrex::Real density = density_func(x, y, c_t);
+
                 const amrex::Real rsq = x*x + y*y;
                 if (x >= a_bounds.hi(0) || x < a_bounds.lo(0) ||
                     y >= a_bounds.hi(1) || y < a_bounds.lo(1) ||
-                    rsq > a_radius*a_radius ||
+                    rsq > radius_sq ||
                     rsq < a_hollow_core_radius*a_hollow_core_radius ||
-                    density_func(x, y, c_t) <= min_density) return;
+                    density <= min_density) return;
 
                 amrex::Real u[3] = {0.,0.,0.};
                 ParticleUtil::get_gaussian_random_momentum(u, a_u_mean, a_u_std, engine);
@@ -287,20 +303,27 @@ InitParticles (const amrex::RealVect& a_u_std,
                 ptd.rdata(PlasmaIdx::y)[pidx] = y;
 
                 if (use_fine_patch) {
-                    ptd.rdata(PlasmaIdx::w)[pidx] = density_func(x, y, c_t) *
-                        (arr_fine(i, j, comp_a) == 0 ? scale_fac_coarse : scale_fac_fine);
+                    const int fine_loc = arr_fine(i, j, comp_a);
+                    if (fine_loc == 0) {
+                        ptd.rdata(PlasmaIdx::w)[pidx] = density * scale_fac_lev[0];
+                    } else if (fine_loc <= fine_transition_cells + 1) {
+                        ptd.rdata(PlasmaIdx::w)[pidx] = density * scale_fac_lev[1];
+                    } else {
+                        ptd.rdata(PlasmaIdx::w)[pidx] = density * scale_fac_lev[2];
+                    }
                 } else {
-                    ptd.rdata(PlasmaIdx::w)[pidx] = density_func(x, y, c_t) * scale_fac_coarse;
+                    ptd.rdata(PlasmaIdx::w)[pidx] = density * scale_fac_lev[0];
                 }
 
-                ptd.rdata(PlasmaIdx::ux)[pidx] = u[0] * c_light;
-                ptd.rdata(PlasmaIdx::uy)[pidx] = u[1] * c_light;
+                ptd.rdata(PlasmaIdx::ux)[pidx] = u[0];
+                ptd.rdata(PlasmaIdx::uy)[pidx] = u[1];
                 ptd.rdata(PlasmaIdx::psi)[pidx] = std::sqrt(1._rt+u[0]*u[0]+u[1]*u[1]+u[2]*u[2])-u[2];
                 ptd.rdata(PlasmaIdx::x_prev)[pidx] = x;
                 ptd.rdata(PlasmaIdx::y_prev)[pidx] = y;
-                ptd.rdata(PlasmaIdx::ux_half_step)[pidx] = u[0] * c_light;
-                ptd.rdata(PlasmaIdx::uy_half_step)[pidx] = u[1] * c_light;
+                ptd.rdata(PlasmaIdx::ux_half_step)[pidx] = u[0];
+                ptd.rdata(PlasmaIdx::uy_half_step)[pidx] = u[1];
                 ptd.rdata(PlasmaIdx::psi_half_step)[pidx] = ptd.rdata(PlasmaIdx::psi)[pidx];
+                ptd.rdata(PlasmaIdx::time_integral)[pidx] = 0._rt;
 #ifdef HIPACE_USE_AB5_PUSH
 #ifdef AMREX_USE_GPU
 #pragma unroll
@@ -355,6 +378,7 @@ InitParticles (const amrex::RealVect& a_u_std,
                         ptd.rdata(PlasmaIdx::uy_half_step)[pidx] * uy_arr[imirror];
                     ptd.rdata(PlasmaIdx::psi_half_step)[midx] =
                         ptd.rdata(PlasmaIdx::psi_half_step)[pidx];
+                    ptd.rdata(PlasmaIdx::time_integral)[midx] = 0._rt;
 #ifdef HIPACE_USE_AB5_PUSH
 #ifdef AMREX_USE_GPU
 #pragma unroll
@@ -434,38 +458,25 @@ InitIonizationModule (const amrex::Geometry& geom, const amrex::Real background_
     m_laser_dp_prefactor.resize(ion_atomic_number);
     m_laser_dp_second_prefactor.resize(ion_atomic_number);
 
-    amrex::Gpu::PinnedVector<amrex::Real> h_adk_power(ion_atomic_number);
-    amrex::Gpu::PinnedVector<amrex::Real> h_adk_prefactor(ion_atomic_number);
-    amrex::Gpu::PinnedVector<amrex::Real> h_adk_exp_prefactor(ion_atomic_number);
-    amrex::Gpu::PinnedVector<amrex::Real> h_laser_adk_prefactor(ion_atomic_number);
-    amrex::Gpu::PinnedVector<amrex::Real> h_laser_dp_prefactor(ion_atomic_number);
-    amrex::Gpu::PinnedVector<amrex::Real> h_laser_dp_second_prefactor(ion_atomic_number);
-
     for (int i=0; i<ion_atomic_number; ++i)
     {
         const amrex::Real n_eff = (i+1) * std::sqrt(UH/h_ionization_energies[i]);
         const amrex::Real C2 = std::pow(2,2*n_eff)/(n_eff*std::tgamma(n_eff+l_eff+1)
                          * std::tgamma(n_eff-l_eff));
-        h_adk_power[i] = -(2 * n_eff - 1.);
+        m_adk_power[i] = -(2 * n_eff - 1.);
         const amrex::Real Uion = h_ionization_energies[i];
-        h_adk_prefactor[i] = dt * wa * C2 * ( Uion / (2.*UH) )
+        m_adk_prefactor[i] = dt * wa * C2 * ( Uion / (2.*UH) )
             * std::pow(2*std::pow((Uion/UH),3./2.)*Ea,2*n_eff - 1);
-        h_adk_exp_prefactor[i] = -2./3. * std::pow( Uion/UH,3./2.) * Ea;
-        h_laser_adk_prefactor[i] = (3./MathConst::pi) * std::pow(Uion/UH, -3./2.) / Ea;
-        h_laser_dp_prefactor[i] = std::sqrt(3./2./Ea) * std::pow(UH/Uion, 3./4.);
-        h_laser_dp_second_prefactor[i] = 2.*ion_atomic_number * std::sqrt(UH/Uion) - 1.;
+        m_adk_exp_prefactor[i] = -2./3. * std::pow( Uion/UH,3./2.) * Ea;
+        m_laser_adk_prefactor[i] = (3./MathConst::pi) * std::pow(Uion/UH, -3./2.) / Ea;
+        m_laser_dp_prefactor[i] = std::sqrt(3./2./Ea) * std::pow(UH/Uion, 3./4.);
+        m_laser_dp_second_prefactor[i] = 2.*ion_atomic_number * std::sqrt(UH/Uion) - 1.;
     }
 
-    amrex::Gpu::copy(amrex::Gpu::hostToDevice,
-        h_adk_power.begin(), h_adk_power.end(), m_adk_power.begin());
-    amrex::Gpu::copy(amrex::Gpu::hostToDevice,
-        h_adk_prefactor.begin(), h_adk_prefactor.end(), m_adk_prefactor.begin());
-    amrex::Gpu::copy(amrex::Gpu::hostToDevice,
-        h_adk_exp_prefactor.begin(), h_adk_exp_prefactor.end(), m_adk_exp_prefactor.begin());
-    amrex::Gpu::copy(amrex::Gpu::hostToDevice,
-        h_laser_adk_prefactor.begin(), h_laser_adk_prefactor.end(), m_laser_adk_prefactor.begin());
-    amrex::Gpu::copy(amrex::Gpu::hostToDevice,
-         h_laser_dp_prefactor.begin(), h_laser_dp_prefactor.end(), m_laser_dp_prefactor.begin());
-    amrex::Gpu::copy(amrex::Gpu::hostToDevice,
-         h_laser_dp_second_prefactor.begin(), h_laser_dp_second_prefactor.end(), m_laser_dp_second_prefactor.begin());
+    m_adk_power.copyToDeviceAsync();
+    m_adk_prefactor.copyToDeviceAsync();
+    m_adk_exp_prefactor.copyToDeviceAsync();
+    m_laser_adk_prefactor.copyToDeviceAsync();
+    m_laser_dp_prefactor.copyToDeviceAsync();
+    m_laser_dp_second_prefactor.copyToDeviceAsync();
 }

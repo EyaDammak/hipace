@@ -13,7 +13,8 @@
 #include "utils/IOUtil.H"
 #include "utils/HipaceProfilerWrapper.H"
 
-MultiBeam::MultiBeam ()
+void
+MultiBeam::ReadParameters ()
 {
     amrex::ParmParse pp("beams");
     queryWithParser(pp, "names", m_names);
@@ -24,6 +25,7 @@ MultiBeam::MultiBeam ()
     m_nbeams = m_names.size();
     for (int i = 0; i < m_nbeams; ++i) {
         m_all_beams.emplace_back(BeamParticleContainer(m_names[i]));
+        m_all_beams.back().ReadParameters();
     }
     m_n_real_particles.resize(m_nbeams, 0);
 }
@@ -69,11 +71,11 @@ MultiBeam::shiftSlippedParticles (const int slice, amrex::Geometry const& geom)
 void
 MultiBeam::AdvanceBeamParticlesSlice (
     const Fields& fields, amrex::Vector<amrex::Geometry> const& gm, const int slice,
-    int const current_N_level)
+    int const current_N_level, int step)
 {
     for (int i=0; i<m_nbeams; i++) {
         if (m_all_beams[i].m_do_push){
-            ::AdvanceBeamParticlesSlice(m_all_beams[i], fields, gm, slice, current_N_level);
+            ::AdvanceBeamParticlesSlice(m_all_beams[i], fields, gm, slice, current_N_level, step);
         }
     }
 

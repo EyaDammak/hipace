@@ -12,6 +12,7 @@
 #include "fields/Fields.H"
 #include "utils/Parser.H"
 #include "utils/GPUUtil.H"
+#include "particles/profiles/GetInitialDensity.H"
 #include <AMReX_AmrParticles.H>
 #include <AMReX_Particles.H>
 #include <AMReX_AmrCore.H>
@@ -32,6 +33,7 @@ struct PlasmaIdx
         ux_half_step,       // momentum half a step behind the current slice for leapfrog pusher
         uy_half_step,       // at the same step for AB5 pusher
         psi_half_step,      // never effected by temp slice
+        time_integral,
 #ifdef HIPACE_USE_AB5_PUSH
         Fx1, Fx2, Fx3, Fx4, Fx5,             // AB5 force terms
         Fy1, Fy2, Fy3, Fy4, Fy5,             //
@@ -56,18 +58,15 @@ public:
     explicit PlasmaParticleContainer (std::string name) :
         amrex::ParticleContainerPureSoA<PlasmaIdx::real_nattribs,PlasmaIdx::int_nattribs>(),
         m_name(name)
-    {
-        ReadParameters();
-    }
+    {}
 
-    /** Read parameters from the input file
-     */
+    /** Read parameters from the input file */
     void ReadParameters ();
 
     /** Allocate data for the beam particles and initialize particles with requested beam profile
     * \param[in] geom Geometry object for the whole domain
      */
-    void InitData (const amrex::Geometry& geom);
+    void InitData (const amrex::Vector<amrex::Geometry>& geom);
 
     /** Initialize 1 xy slice of particles, with fixed number of particles per cell
      *
@@ -115,22 +114,12 @@ public:
                           const MultiLaser& laser,
                           const amrex::Real background_density_SI);
 
-    /** Mark the plasma particles that has been injected
-     *
-     * \param[in] lev MR level
-     * \param[in] fields the general field class
-     * \param[in] laser MultiLaser object containing the laser details
-     * \param[in] islice Slice index corresponding to the current simulation slice
-     */
-    void InjectionCondition (const int lev, const Fields& fields, const MultiLaser& laser, const int islice);
-
     /** Do the transfer of particles from the plasma container to the beam container
      *
-     * \param[in] laser MultiLaser object containing the laser details
      * \param[in] gm Geometry object for the whole domain
      * \param[in] islice Slice index corresponding to the current simulation slice
      */
-    void PlasmaToBeam (const MultiLaser& laser, amrex::Vector<amrex::Geometry> const& gm, const int islice);
+    void PlasmaToBeam (amrex::Vector<amrex::Geometry> const& gm, const int islice);
 
     /** Reorder particles to speed-up current deposition
      * \param[in] islice zeta slice index
@@ -182,7 +171,9 @@ public:
     // init:
 
     amrex::Parser m_parser; /**< owns data for m_density_func */
-    amrex::ParserExecutor<3> m_density_func; /**< Density function for the plasma */
+    std::shared_ptr<float> m_f_density_data; /**< owns data for m_density_func */
+    std::shared_ptr<double> m_d_density_data; /**< owns data for m_density_func */
+    PlasmaDensityAccessor m_density_func; /**< Density function for the plasma */
     amrex::Real m_min_density {0.}; /**< minimal density at which particles are injected */
     bool m_use_density_table; /**< if a density value table was specified */
     /** plasma density value table, key: position=c*time, value=density function string */
@@ -191,16 +182,18 @@ public:
     /** maximum weighting factor gamma/(Psi +1) before particle is regarded as violating
      *  the quasi-static approximation and is removed */
     amrex::Real m_max_qsa_weighting_factor {35.};
-    amrex::Real m_radius {std::numeric_limits<amrex::Real>::infinity()}; /**< radius of the plasma */
+    amrex::Real m_radius {std::numeric_limits<amrex::Real>::max()}; /**< radius of the plasma */
     /** radius of the plasma insitu diagnostics */
-    amrex::Real m_insitu_radius {std::numeric_limits<amrex::Real>::infinity()};
+    amrex::Real m_insitu_radius {std::numeric_limits<amrex::Real>::max()};
     amrex::Real m_hollow_core_radius {0.}; /**< hollow core radius of the plasma */
+    bool m_read_fine_patch = false;
     bool m_use_fine_patch = false;
     int m_fine_transition_cells = 5;
     amrex::Parser m_parser_fine_patch; /**< owns data for m_fine_patch_func */
     amrex::ParserExecutor<2> m_fine_patch_func;
     amrex::Array<int, 2> m_ppc {0,0}; /**< Number of particles per cell in each direction */
     amrex::Array<int, 2> m_ppc_fine {0,0}; /**< Number of particles per cell in each direction */
+    amrex::Array<int, 2> m_ppc_fine2 {0,0}; /**< Number of particles per cell in each direction */
     /**< Prevent a particle from being initialized at the domain center */
     bool m_prevent_centered_particle = false;
     amrex::RealVect m_u_mean {0,0,0}; /**< Avg momentum in each direction normalized by m*c */
@@ -225,20 +218,19 @@ public:
     std::string m_product_name = ""; /**< name of Ionization product plasma */
     PlasmaParticleContainer* m_product_pc = nullptr; /**< Ionization product plasma */
     /** to calculate Ionization probability with ADK formula */
-    amrex::Gpu::DeviceVector<amrex::Real> m_adk_prefactor;
+    amrex::Gpu::Buffer<amrex::Real> m_adk_prefactor;
     /** to calculate Ionization probability with ADK formula */
-    amrex::Gpu::DeviceVector<amrex::Real> m_adk_exp_prefactor;
+    amrex::Gpu::Buffer<amrex::Real> m_adk_exp_prefactor;
     /** to calculate Ionization probability with ADK formula */
-    amrex::Gpu::DeviceVector<amrex::Real> m_adk_power;
+    amrex::Gpu::Buffer<amrex::Real> m_adk_power;
     /** to calculate laser Ionization probability with ADK formula */
-    amrex::Gpu::DeviceVector<amrex::Real> m_laser_adk_prefactor;
+    amrex::Gpu::Buffer<amrex::Real> m_laser_adk_prefactor;
     /** to calculate laser ionization momentum width for linear polarization */
-    amrex::Gpu::DeviceVector<amrex::Real> m_laser_dp_prefactor;
-    amrex::Gpu::DeviceVector<amrex::Real> m_laser_dp_second_prefactor;
+    amrex::Gpu::Buffer<amrex::Real> m_laser_dp_prefactor;
+    /** to calculate laser ionization momentum width at the second order for linear polarization */
+    amrex::Gpu::Buffer<amrex::Real> m_laser_dp_second_prefactor;
     // laser injection:
     bool m_can_laser_injection = false; /**< whether laser injection is enabled */
-    amrex::Real m_uz_threshold = 1.;
-    amrex::Real m_injection_weight_factor = 1.;
     std::string m_product_beam_name = ""; /**< name of Injection product beam */
     BeamParticleContainer* m_product_beam_pc = nullptr; /**< Injection product beam */
 
@@ -270,7 +262,7 @@ private:
     /** Sum of all per-slice int plasma properties */
     amrex::Vector<int> m_insitu_sum_idata;
     /** Prefix/path for the output files */
-    std::string m_insitu_file_prefix = "diags/plasma_insitu";
+    std::string m_insitu_file_prefix = "";
 };
 
 /** \brief Iterator over boxes in a particle container */

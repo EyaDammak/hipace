@@ -25,7 +25,10 @@ public:
     void GetEnvelopeFromFileHelper (amrex::Geometry laser_geom_3D);
     template<typename input_type>
     void GetEnvelopeFromFile (amrex::Geometry laser_geom_3D);
-    Laser (std::string name, amrex::Geometry laser_geom_3D);
+    Laser (std::string name);
+
+    /** Read parameters from the input file */
+    void ReadParameters (const amrex::Geometry& laser_geom_3D);
 
     std::string m_name {""};
     /** The way to initialize a laser (from_file/gaussian/parser)*/
@@ -33,12 +36,14 @@ public:
     amrex::Real m_a0 {0.}; /**< Laser peak normalized amplitude */
     amrex::Real m_w0 {0.}; /**< Laser waist */
     amrex::Real m_CEP {0.}; /**< Laser carrier-envelope phase (CEP) */
-    /** Propagation angle of the pulse in the yz plane (0 is the along the z axis) */
+    /** Propagation angle of the pulse in the yz plane (0 is along the z axis) */
     amrex::Real m_propagation_angle_yz {0.};
-    /**Pulse front tilt angle of the pulse in yz plane (pi/2 is no PFT)*/
-    amrex::Real m_PFT_yz {MathConst::pi/2.0};
     amrex::Real m_L0 {0.}; /**< Laser length (HW 1/e in amplitude) */
     amrex::Real m_tau {0.}; /**< Laser duration (HW 1/e in amplitude) */
+    amrex::Real m_STC_theta_xy {0.};/**< Initial propagation angel on YZ plane */
+    amrex::Real m_zeta {0.};/**< The value of first order spatial chirp in m * s */
+    amrex::Real m_beta {0.};/**< The value of first order angular chirp in  s */
+    amrex::Real m_phi2 {0.};/**< The value of group delayed dispersion in s ^ -2 */
     /** Focal distance of the laser pulse */
     amrex::Real m_focal_distance {0.};
     /** Average position of the Gaussian laser pulse */
@@ -62,8 +67,8 @@ public:
     int m_file_num_iteration = 0;
     /** Geometry of the laser file, 'rt' or 'xyt' */
     std::string m_file_geometry = "";
-    /** Wavelength from file */
-    amrex::Real m_lambda0_from_file {0.};
+    /** central wavelength of the laser */
+    amrex::Real m_init_lambda0 {0.};
 };
 
 #endif // LASER_H_

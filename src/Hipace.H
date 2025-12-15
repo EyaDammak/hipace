@@ -29,10 +29,6 @@
 #  include <AMReX_MLMG.H>
 #endif
 
-#ifdef HIPACE_USE_OPENPMD
-#   include <openPMD/openPMD.hpp>
-#endif
-
 #include <memory>
 
 namespace hpmg { class MultiGrid; }
@@ -89,6 +85,9 @@ public:
      * and initialize longitudinal and transverse MPI communicators */
     Hipace ();
 
+    /** Read parameters from the input file */
+    void ReadParameters ();
+
     /** Get singleton instance */
     static Hipace& GetInstance ();
 
@@ -125,6 +124,14 @@ public:
      * \param[in] which_slice defines if this or the salame slice is handled
      */
     void ExplicitMGSolveBxBy (const int lev, const int which_slice);
+
+    /**
+     * \brief Compute Ez on the Next slice
+     *
+     * \param[in] current_N_level number of MR levels
+     * \param[in] step current time step
+     */
+    void CalculateEzNext (const int current_N_level, const int step);
 
     /** \brief Reset plasma and field slice quantities to initial value.
      *
@@ -179,10 +186,14 @@ public:
     amrex::Vector<amrex::DistributionMapping> m_slice_dm;
     /** xy slice BoxArray, vector over MR levels. Contains only one box */
     amrex::Vector<amrex::BoxArray> m_slice_ba;
+    /** size of the plasma fine patch for each MR level */
+    amrex::Vector<std::array<amrex::Real, 2>> m_plasma_fine_patch;
     /** Pointer to current (and only) instance of class Hipace */
     inline static Hipace* m_instance = nullptr;
     /** Whether to use normalized units */
     inline static bool m_normalized_units = false;
+    /** Default location for diagnostics output */
+    inline static std::string m_output_folder = "diags";
     /** All field data (3D array, slices) and field methods */
     Fields m_fields;
     /** Contains all beam species */
@@ -196,7 +207,7 @@ public:
     /** Number of time iterations */
     inline static int m_max_step = 0;
     /** Maximum simulation time */
-    inline static amrex::Real m_max_time = std::numeric_limits<amrex::Real>::infinity();
+    inline static amrex::Real m_max_time = std::numeric_limits<amrex::Real>::max();
     /** Physical time of the simulation. At the end of the time step, it is the physical time
      * at which the fields have been calculated. The beam is one step ahead. */
     inline static amrex::Real m_physical_time = 0.0;
@@ -227,8 +238,11 @@ public:
     inline static bool m_do_beam_jz_minus_rho = false;
     /** Whether to deposit rho (plasma) for diagnostics */
     inline static bool m_deposit_rho = false;
+    inline static bool m_deposit_rho_beam = false;
     /** Whether to deposit rho for every individual plasma for diagnostics */
     inline static bool m_deposit_rho_individual = false;
+    /** Whether to deposit temperature for every individual plasma for diagnostics */
+    inline static bool m_deposit_temp_individual = false;
     /** Whether to interpolate the neutralizing background to MR levels 1 and 2 instead of depositing it */
     inline static bool m_interpolate_neutralizing_background = false;
     /** Whether to use tiling for particle operations */
@@ -315,11 +329,11 @@ public:
     // Grid external fields
 
     /** Whether grid external fields should be used for this beam */
-    bool m_use_gird_external_fields = false;
-    /** Grid external field functions for Bx By Bz */
-    amrex::GpuArray<amrex::ParserExecutor<4>, 3> m_grid_external_fields;
+    bool m_use_grid_external_fields = false;
+    /** Grid external field functions for Bx By Bz Psi Ez*/
+    amrex::GpuArray<amrex::ParserExecutor<4>, 5> m_grid_external_fields;
     /** Owns data for m_grid_external_fields */
-    amrex::Array<amrex::Parser, 3> m_grid_external_fields_parser;
+    amrex::Array<amrex::Parser, 5> m_grid_external_fields_parser;
 
 private:
 

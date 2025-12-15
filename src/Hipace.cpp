@@ -53,6 +53,7 @@ Hipace_early_init::Hipace_early_init (Hipace* instance)
     queryWithParser(pph, "depos_derivative_type", m_depos_derivative_type);
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(m_depos_order_xy != 0 || m_depos_derivative_type != 0,
                             "Analytic derivative with depos_order=0 would vanish");
+    queryWithParser(pph, "output_folder", Hipace::m_output_folder);
 
     amrex::ParmParse pp_amr("amr");
     int max_level = 0;
@@ -74,13 +75,23 @@ Hipace::GetInstance ()
 }
 
 Hipace::Hipace () :
-    Hipace_early_init(this),
-    m_fields(m_N_level),
-    m_multi_beam(),
-    m_multi_plasma(),
-    m_adaptive_time_step(m_multi_beam.get_nbeams()),
-    m_multi_laser(),
-    m_diags(m_N_level, m_multi_laser.UseLaser())
+    Hipace_early_init(this)
+{
+    m_fields.ReadParameters(m_N_level);
+    m_multi_beam.ReadParameters();
+    m_multi_plasma.ReadParameters();
+    m_adaptive_time_step.ReadParameters(m_multi_beam.get_nbeams());
+    m_multi_laser.ReadParameters();
+    m_grid_current.ReadParameters();
+    m_diags.ReadParameters(m_N_level, m_multi_laser.UseLaser());
+#ifdef HIPACE_USE_OPENPMD
+    m_openpmd_writer.ReadParameters();
+#endif
+    ReadParameters();
+}
+
+void
+Hipace::ReadParameters ()
 {
     amrex::ParmParse pp;// Traditionally, max_step and stop_time do not have prefix.
     queryWithParser(pp, "max_step", m_max_step);
@@ -116,8 +127,14 @@ Hipace::Hipace () :
     queryWithParser(pph, "do_beam_jz_minus_rho", m_do_beam_jz_minus_rho);
     m_deposit_rho = m_diags.needsRho();
     queryWithParser(pph, "deposit_rho", m_deposit_rho);
+    queryWithParser(pph, "deposit_rho_beam", m_deposit_rho_beam);
+    if (m_deposit_rho_beam) {
+        m_deposit_rho = true;
+    }
     m_deposit_rho_individual = m_diags.needsRhoIndividual();
     queryWithParser(pph, "deposit_rho_individual", m_deposit_rho_individual);
+    m_deposit_temp_individual = m_diags.needsTempIndividual();
+    queryWithParser(pph, "deposit_temp_individual", m_deposit_temp_individual);
     queryWithParser(pph, "interpolate_neutralizing_background",
         m_interpolate_neutralizing_background);
     bool do_mfi_sync = false;
@@ -236,7 +253,8 @@ Hipace::Hipace () :
     /** Initialize the collision objects */
     m_ncollisions = m_collision_names.size();
     for (int i = 0; i < m_ncollisions; ++i) {
-        m_all_collisions.emplace_back(CoulombCollision(m_multi_plasma.m_names, m_multi_beam.m_names, m_collision_names[i]));
+        m_all_collisions.emplace_back(CoulombCollision());
+        m_all_collisions.back().ReadParameters(m_multi_plasma.m_names, m_multi_beam.m_names, m_collision_names[i]);
     }
     if (m_normalized_units && m_ncollisions > 0) {
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(m_background_density_SI!=0,
@@ -245,14 +263,14 @@ Hipace::Hipace () :
     }
 
     // external fields applied to the grid
-    amrex::Array<std::string, 3> field_str = {"0", "0", "0"};
-    m_use_gird_external_fields = queryWithParser(pph, "grid_external_B(x,y,z,t)", field_str);
-    m_grid_external_fields[0] = makeFunctionWithParser<4>(field_str[0],
-        m_grid_external_fields_parser[0], {"x", "y", "z", "t"});
-    m_grid_external_fields[1] = makeFunctionWithParser<4>(field_str[1],
-        m_grid_external_fields_parser[1], {"x", "y", "z", "t"});
-    m_grid_external_fields[2] = makeFunctionWithParser<4>(field_str[2],
-        m_grid_external_fields_parser[2], {"x", "y", "z", "t"});
+    amrex::Array<std::string, 5> field_str = {"0", "0", "0", "0", "0"};
+    m_use_grid_external_fields = queryWithParser(pph, "grid_external_fields(x,y,z,t)", field_str);
+    for (int i = 0; i < 5; ++i) {
+        m_grid_external_fields[i] = makeFunctionWithParser<4>(field_str[i],
+            m_grid_external_fields_parser[i], {"x", "y", "z", "t"});
+    }
+    DeprecatedInput("hipace", "grid_external_E(x,y,z,t)", "grid_external_fields(x,y,z,t)");
+    DeprecatedInput("hipace", "grid_external_B(x,y,z,t)", "grid_external_fields(x,y,z,t)");
 }
 
 void
@@ -295,6 +313,7 @@ Hipace::InitData ()
     m_multi_buffer.initialize(m_3D_geom[0].Domain().length(2), m_multi_beam, m_multi_laser);
 
     amrex::ParmParse pph("hipace");
+    queryWithParser(pph, "initial_time", m_initial_time);
     bool do_output_input = false;
     queryWithParser(pph, "output_input", do_output_input);
     if (do_output_input && amrex::ParallelDescriptor::IOProcessor()) {
@@ -309,12 +328,15 @@ Hipace::InitData ()
 void
 Hipace::MakeGeometry ()
 {
+    using namespace amrex::literals;
+
     m_3D_geom.resize(m_N_level);
     m_3D_dm.resize(m_N_level);
     m_3D_ba.resize(m_N_level);
     m_slice_geom.resize(m_N_level);
     m_slice_dm.resize(m_N_level);
     m_slice_ba.resize(m_N_level);
+    m_plasma_fine_patch.resize(m_N_level);
 
     // make 3D Geometry, BoxArray, DistributionMapping on level 0
     amrex::ParmParse pp_amr("amr");
@@ -347,6 +369,48 @@ Hipace::MakeGeometry ()
         getWithParser(pp_mrlev, "patch_lo", patch_lo_lev);
         getWithParser(pp_mrlev, "patch_hi", patch_hi_lev);
 
+        std::array<amrex::Real, 2> ref_ratio {0, 0}; // relative to level 0
+        const bool rr_specified = queryWithParser(pp_mrlev, "ref_ratio", ref_ratio);
+
+        m_plasma_fine_patch[lev] = {0, 0}; // relative to level lev patch length
+        queryWithParser(pp_mrlev, "plasma_fine_patch", m_plasma_fine_patch[lev]);
+
+        if (rr_specified) {
+            std::array<amrex::Real, 2> patch_center_lev {
+                0.5_rt * (patch_hi_lev[0] + patch_lo_lev[0]),
+                0.5_rt * (patch_hi_lev[1] + patch_lo_lev[1])
+            };
+
+            std::array<amrex::Real, 2> patch_len_lev {
+                n_cells_lev[0] * m_3D_geom[0].CellSize(0) / ref_ratio[0],
+                n_cells_lev[1] * m_3D_geom[0].CellSize(1) / ref_ratio[1],
+            };
+
+            std::array<amrex::Real, 2> old_patch_len {
+                patch_hi_lev[0] - patch_lo_lev[0],
+                patch_hi_lev[1] - patch_lo_lev[1]
+            };
+
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                old_patch_len[0] > 0._rt && old_patch_len[1] > 0._rt &&
+                (std::abs((patch_len_lev[0] - old_patch_len[0]) / old_patch_len[0]) <= 0.05_rt) &&
+                (std::abs((patch_len_lev[1] - old_patch_len[1]) / old_patch_len[1]) <= 0.05_rt),
+                "The refined patch would need to be changed by more than 5% "
+                "to fit the requested refinement ratio! "
+                "The patch length from patch_lo and patch_hi is " +
+                amrex::ToString(old_patch_len) +
+                " but the ref ratio and number of cells would give " +
+                amrex::ToString(patch_len_lev) +
+                "!"
+            );
+
+            patch_lo_lev[0] = patch_center_lev[0] - patch_len_lev[0] * 0.5_rt;
+            patch_lo_lev[1] = patch_center_lev[1] - patch_len_lev[1] * 0.5_rt;
+
+            patch_hi_lev[0] = patch_center_lev[0] + patch_len_lev[0] * 0.5_rt;
+            patch_hi_lev[1] = patch_center_lev[1] + patch_len_lev[1] * 0.5_rt;
+        }
+
         const amrex::Real pos_offset_z = GetPosOffset(2, m_3D_geom[0], m_3D_geom[0].Domain());
 
         const int zeta_lo = std::max( m_3D_geom[lev-1].Domain().smallEnd(2),
@@ -357,8 +421,8 @@ Hipace::MakeGeometry ()
             int(amrex::Math::round((patch_hi_lev[2] - pos_offset_z) * m_3D_geom[0].InvCellSize(2)))
         );
 
-        patch_lo_lev[2] = (zeta_lo-0.5)*m_3D_geom[0].CellSize(2) + pos_offset_z;
-        patch_hi_lev[2] = (zeta_hi+0.5)*m_3D_geom[0].CellSize(2) + pos_offset_z;
+        patch_lo_lev[2] = (zeta_lo-0.5_rt)*m_3D_geom[0].CellSize(2) + pos_offset_z;
+        patch_hi_lev[2] = (zeta_hi+0.5_rt)*m_3D_geom[0].CellSize(2) + pos_offset_z;
 
         const amrex::Box domain_3D_lev{amrex::IntVect(0,0,zeta_lo),
             amrex::IntVect(n_cells_lev[0]-1, n_cells_lev[1]-1, zeta_hi)};
@@ -384,6 +448,30 @@ Hipace::MakeGeometry ()
         amrex::Vector<int> procmap_lev{amrex::ParallelDescriptor::MyProc()};
         m_3D_ba[lev].define(bl_lev);
         m_3D_dm[lev].define(procmap_lev);
+    }
+
+    if (m_verbose > 0) {
+        for (int lev=0; lev<m_N_level; ++lev) {
+            amrex::Print()
+                << "Using "
+                << m_3D_geom[lev].Domain().length()
+                << " cells\n    from "
+                << amrex::RealVect{m_3D_geom[lev].ProbLoArray()}
+                << "\n    to "
+                << amrex::RealVect{m_3D_geom[lev].ProbHiArray()};
+            if (lev > 0) {
+                amrex::Print()
+                    << "\n    on MR level "
+                    << lev
+                    << " with refinement ratio "
+                    << amrex::RealVect{
+                        m_3D_geom[0].CellSize(0) / m_3D_geom[lev].CellSize(0),
+                        m_3D_geom[0].CellSize(1) / m_3D_geom[lev].CellSize(1),
+                        m_3D_geom[0].CellSize(2) / m_3D_geom[lev].CellSize(2)
+                    };
+            }
+            amrex::Print() << "\n";
+        }
     }
 
     // make slice Geometry, BoxArray, DistributionMapping every level
@@ -417,12 +505,15 @@ Hipace::Evolve ()
         const amrex::Box& bx = m_3D_ba[0][0];
 
         if (m_multi_laser.UseLaser()) {
-            AMREX_ALWAYS_ASSERT(!m_adaptive_time_step.m_do_adaptive_time_step);
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                !m_adaptive_time_step.m_do_adaptive_time_step,
+                "Adaptive time step cannot be used with laser pulses."
+            );
         }
 
         m_physical_time = step == 0 ? m_initial_time : m_multi_buffer.get_time();
 
-        if (m_physical_time == std::numeric_limits<amrex::Real>::infinity()) {
+        if (m_physical_time == std::numeric_limits<amrex::Real>::max()) {
             if (step+1 <= m_max_step && !m_has_last_step) {
                 m_multi_buffer.put_time(m_physical_time);
             }
@@ -437,7 +528,7 @@ Hipace::Evolve ()
         if (m_physical_time == m_max_time) {
             m_has_last_step = true;
             m_dt = 0.;
-            next_time = std::numeric_limits<amrex::Real>::infinity();
+            next_time = std::numeric_limits<amrex::Real>::max();
         } else if ((m_physical_time + m_dt >= m_max_time && m_physical_time < m_max_time) ||
                    (m_physical_time + m_dt <= m_max_time && m_physical_time > m_max_time)) {
             m_dt = m_max_time - m_physical_time;
@@ -568,14 +659,6 @@ Hipace::Evolve ()
 void
 Hipace::SolveOneSlice (int islice, int step)
 {
-#ifdef AMREX_USE_MPI
-    {
-        // Call a MPI function so that the MPI implementation has a chance to
-        // run tasks necessary to make progress with asynchronous communications.
-        int flag = 0;
-        MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, MPI_STATUS_IGNORE);
-    }
-#endif
     HIPACE_PROFILE("Hipace::SolveOneSlice()");
 
     int current_N_level = 1;
@@ -596,8 +679,6 @@ Hipace::SolveOneSlice (int islice, int step)
         m_multi_beam.ReorderParticles( WhichBeamSlice::This, step, m_slice_geom[0]);
     }
 
-    m_multi_plasma.InSituComputeDiags(step, islice, m_max_step, m_physical_time, m_max_time);
-
     if (m_N_level > 1) {
         m_multi_beam.TagByLevel(current_N_level, m_3D_geom, WhichSlice::This);
         m_multi_plasma.TagByLevel(current_N_level, m_3D_geom);
@@ -613,6 +694,15 @@ Hipace::SolveOneSlice (int islice, int step)
 
     // write laser aabs into fields MultiFab
     m_multi_laser.UpdateLaserAabs(islice, current_N_level, m_fields, m_3D_geom);
+
+    // has to be after aabs writing
+    m_multi_plasma.InSituComputeDiags(step, islice, m_max_step, m_physical_time, m_max_time);
+
+    // deposit temperature
+    for (int lev=0; lev<current_N_level; ++lev) {
+        // deposit w, ux, uy, uz, ux2, uy2 and uz2 for all plasmas
+        m_multi_plasma.DoDepositTemperature(m_fields, m_3D_geom, lev);
+    }
 
     // deposit current
     for (int lev=0; lev<current_N_level; ++lev) {
@@ -715,21 +805,23 @@ Hipace::SolveOneSlice (int islice, int step)
     // plasma laser ionization
     m_multi_plasma.DoLaserIonization(islice, m_multi_laser.GetLaserGeom(), m_multi_laser);
 
-    // injection
-    for (int lev=0; lev<current_N_level; ++lev) {
-        m_multi_plasma.DoLaserInjection(lev, m_fields, m_multi_laser, m_3D_geom, islice);
-    }
-
     // Push plasma particles
     for (int lev=0; lev<current_N_level; ++lev) {
         m_multi_plasma.AdvanceParticles(m_fields, m_3D_geom, false, lev, current_N_level);
+    }
+
+    // injection
+    m_multi_plasma.DoLaserInjection(m_3D_geom, islice);
+
+    if (m_depos_order_z == 2) {
+        CalculateEzNext(current_N_level, step);
     }
 
     // get minimum beam acceleration on level 0
     m_adaptive_time_step.GatherMinAccSlice(m_multi_beam, m_3D_geom[0], m_fields);
 
     // Push beam particles
-    m_multi_beam.AdvanceBeamParticlesSlice(m_fields, m_3D_geom, islice, current_N_level);
+    m_multi_beam.AdvanceBeamParticlesSlice(m_fields, m_3D_geom, islice, current_N_level, step);
 
     m_multi_beam.shiftSlippedParticles(islice, m_3D_geom[0]);
 
@@ -750,6 +842,39 @@ Hipace::SolveOneSlice (int islice, int step)
     m_multi_beam.shiftBeamSlices();
 
     m_multi_laser.ShiftLaserSlices(islice);
+}
+
+void
+Hipace::CalculateEzNext (const int current_N_level, const int step)
+{
+    if (m_N_level > 1) {
+        // tag to next slice for deposition
+        m_multi_plasma.TagByLevel(current_N_level, m_3D_geom);
+    }
+
+    for (int lev=0; lev<current_N_level; ++lev) {
+
+        if (m_explicit) {
+            // add beam jx jy to the next slice
+            m_fields.duplicate(lev, WhichSlice::Next, {"jx", "jy"},
+                                    WhichSlice::Next, {"jx_beam", "jy_beam"});
+        } else {
+            // beams deposit jx jy to the next slice
+            m_multi_beam.DepositCurrentSlice(m_fields, m_3D_geom, lev, step,
+                m_do_beam_jx_jy_deposition, false, false, WhichSlice::Next, WhichBeamSlice::Next);
+        }
+
+        // deposit plasma jx and jy on the next slice
+        m_multi_plasma.DepositCurrent(m_fields,
+            WhichSlice::Next, true, false, false, false, false, m_3D_geom, lev);
+    }
+
+    m_fields.SolvePoissonEz(m_3D_geom, current_N_level, WhichSlice::Next);
+
+    for (int lev=0; lev<current_N_level; ++lev) {
+        // clean up jx and jy
+        m_fields.setVal(0., lev, WhichSlice::Next, "jx", "jy");
+    }
 }
 
 void
@@ -1058,7 +1183,7 @@ Hipace::PredictorCorrectorLoopToSolveBxBy (const int islice, const int current_N
 void
 Hipace::AddGridExternalFields (const int lev, const int islice)
 {
-    if (!m_use_gird_external_fields) {
+    if (!m_use_grid_external_fields) {
         return;
     }
     HIPACE_PROFILE("Hipace::AddGridExternalFields()");
@@ -1067,19 +1192,23 @@ Hipace::AddGridExternalFields (const int lev, const int islice)
     const amrex::Real dy = m_3D_geom[lev].CellSize(Direction::y);
     const amrex::Real dz = m_3D_geom[lev].CellSize(Direction::z);
 
+    const amrex::Real dx_inv = m_3D_geom[lev].InvCellSize(Direction::x);
+    const amrex::Real dy_inv = m_3D_geom[lev].InvCellSize(Direction::y);
+
     const amrex::Real poff_x = GetPosOffset(0, m_3D_geom[lev], m_3D_geom[lev].Domain());
     const amrex::Real poff_y = GetPosOffset(1, m_3D_geom[lev], m_3D_geom[lev].Domain());
     const amrex::Real poff_z = GetPosOffset(2, m_3D_geom[lev], m_3D_geom[lev].Domain());
 
     auto external_fields = m_grid_external_fields;
 
-    const int ExmBy = Comps[WhichSlice::This]["ExmBy"];
-    const int EypBx = Comps[WhichSlice::This]["EypBx"];
     const int Bx = Comps[WhichSlice::This]["By"];
     const int By = Comps[WhichSlice::This]["Bx"];
     const int Bz = Comps[WhichSlice::This]["Bz"];
+    const int Psi = Comps[WhichSlice::This]["Psi"];
+    const int ExmBy = Comps[WhichSlice::This]["ExmBy"];
+    const int EypBx = Comps[WhichSlice::This]["EypBx"];
+    const int Ez = Comps[WhichSlice::This]["Ez"];
 
-    const amrex::Real clight = m_phys_const.c;
     const amrex::Real time = m_physical_time;
 
     amrex::MultiFab& slicemf = m_fields.getSlices(lev);
@@ -1098,17 +1227,29 @@ Hipace::AddGridExternalFields (const int lev, const int islice)
             {
                 const amrex::Real x = i * dx + poff_x;
                 const amrex::Real y = j * dy + poff_y;
+                const amrex::Real xlo = (i-1) * dx + poff_x;
+                const amrex::Real ylo = (j-1) * dy + poff_y;
+                const amrex::Real xhi = (i+1) * dx + poff_x;
+                const amrex::Real yhi = (j+1) * dy + poff_y;
                 const amrex::Real z = islice * dz + poff_z;
 
                 const amrex::Real Bxp = external_fields[0](x, y, z, time);
                 const amrex::Real Byp = external_fields[1](x, y, z, time);
                 const amrex::Real Bzp = external_fields[2](x, y, z, time);
+                const amrex::Real Psip = external_fields[3](x, y, z, time);
+                const amrex::Real Psipxlo = external_fields[3](xlo, y, z, time);
+                const amrex::Real Psipxhi = external_fields[3](xhi, y, z, time);
+                const amrex::Real Psipylo = external_fields[3](x, ylo, z, time);
+                const amrex::Real Psipyhi = external_fields[3](x, yhi, z, time);
+                const amrex::Real Ezp = external_fields[4](x, y, z, time);
 
-                arr(i, j, ExmBy) -= clight * Byp;
-                arr(i, j, EypBx) += clight * Bxp;
                 arr(i, j, Bx) += Bxp;
                 arr(i, j, By) += Byp;
                 arr(i, j, Bz) += Bzp;
+                arr(i, j, Psi) += Psip;
+                arr(i, j, ExmBy) += - (Psipxhi - Psipxlo) * dx_inv;
+                arr(i, j, EypBx) += - (Psipyhi - Psipylo) * dy_inv;
+                arr(i, j, Ez) += Ezp;
             });
     }
 }

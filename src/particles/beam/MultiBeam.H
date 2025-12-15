@@ -16,13 +16,8 @@ class MultiBeam
 
 public:
 
-    /** Constructor
-     */
-    MultiBeam ();
-
-    /** Destructor
-     */
-    ~MultiBeam () {}
+    /** Read parameters from the input file */
+    void ReadParameters ();
 
     /** Loop over all beam species and deposit their current on the 2D XY slice
      * \param[in] fields Field object, with 2D slice MultiFabs
@@ -49,10 +44,11 @@ public:
      * \param[in] gm Geometry object at level lev
      * \param[in] slice longitudinal slice
      * \param[in] current_N_level number of MR levels active on the current slice
+     * \param[in] step time step
      */
     void AdvanceBeamParticlesSlice (
         const Fields& fields, amrex::Vector<amrex::Geometry> const& gm, const int slice,
-        int const current_N_level);
+        int const current_N_level, int step);
 
     /** Compute reduced beam diagnostics of current slice, store in member variable.
      * \param[in] step time step of simulation
@@ -87,13 +83,16 @@ public:
     /** \brief Return 1 species
      * \param[in] i index of the beam
      */
-    const BeamParticleContainer& getBeam (int i) const {return m_all_beams[i];}
+    [[nodiscard]] const BeamParticleContainer&
+    getBeam (int i) const {return m_all_beams[i];}
 
     /** returns the number of beams */
-    int get_nbeams () const {return m_nbeams;}
+    [[nodiscard]] int
+    get_nbeams () const {return m_nbeams;}
 
     /** returns the name of a beam */
-    std::string get_name (int i) const {return m_all_beams[i].get_name();}
+    [[nodiscard]] std::string
+    get_name (int i) const {return m_all_beams[i].get_name();}
 
     /** \brief Store the finest level of every beam particle on which_slice in the cpu() attribute.
      * \param[in] current_N_level number of MR levels active on the current slice
@@ -113,7 +112,8 @@ public:
     /** \brief returns if the SALAME algorithm should be used on this slice
      * \param[in] step time step of simulation
      */
-    bool isSalameNow (const int step);
+    [[nodiscard]] bool
+    isSalameNow (const int step);
 
     /** \brief returns if any beam uses the SALAME algorithm
      */

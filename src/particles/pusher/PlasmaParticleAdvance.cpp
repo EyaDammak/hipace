@@ -67,6 +67,9 @@ AdvancePlasmaParticles (PlasmaParticleContainer& plasma, const Fields & fields,
 
         const auto enforceBC = EnforceBC();
         const amrex::Real dz = gm[0].CellSize(2) / n_subcycles;
+        const amrex::Real dzeta = gm[0].CellSize(2);
+        const amrex::Real dt = Hipace::GetInstance().m_dt;
+        const bool check_time = plasma.m_can_laser_injection;
 
         if (!temp_slice && lev == 0) {
             // only count particles on non-temp slices and only once for all MR levels
@@ -75,7 +78,6 @@ AdvancePlasmaParticles (PlasmaParticleContainer& plasma, const Fields & fields,
 
         const amrex::Real laser_norm = (plasma.m_charge/phys_const.q_e) * (phys_const.m_e/plasma.m_mass)
             * (plasma.m_charge/phys_const.q_e) * (phys_const.m_e/plasma.m_mass);
-        const amrex::Real clight = phys_const.c;
         const amrex::Real clight_inv = 1._rt/phys_const.c;
         const amrex::Real charge_mass_clight_ratio = plasma.m_charge/(plasma.m_mass * phys_const.c);
 
@@ -126,11 +128,12 @@ AdvancePlasmaParticles (PlasmaParticleContainer& plasma, const Fields & fields,
                                 dx_inv, dy_inv, x_pos_offset, y_pos_offset);
                         }
 
-                        Bxp *= clight;
-                        Byp *= clight;
+                        ExmByp *= clight_inv;
+                        EypBxp *= clight_inv;
+                        Ezp *= clight_inv;
                         Aabssqp *= 0.5_rt * laser_norm_ion;
-                        AabssqDxp *= 0.25_rt * clight * laser_norm_ion;
-                        AabssqDyp *= 0.25_rt * clight * laser_norm_ion;
+                        AabssqDxp *= 0.25_rt * laser_norm_ion;
+                        AabssqDyp *= 0.25_rt * laser_norm_ion;
                     }
 
 #ifndef HIPACE_USE_AB5_PUSH
@@ -141,17 +144,26 @@ AdvancePlasmaParticles (PlasmaParticleContainer& plasma, const Fields & fields,
                     amrex::Real ux = ptd.rdata(PlasmaIdx::ux_half_step)[ip];
                     amrex::Real uy = ptd.rdata(PlasmaIdx::uy_half_step)[ip];
                     amrex::Real psi = ptd.rdata(PlasmaIdx::psi_half_step)[ip];
+                    amrex::Real time_integral = ptd.rdata(PlasmaIdx::time_integral)[ip];
+
+                    bool is_valid = true;
+                    amrex::Real psi_inv = 0._rt;
 
                     // full push in momentum
                     // from t-1/2 to t+1/2
                     // using the fields at t
                     for (int isub=0; isub<nsub; ++isub) {
 
-                        const amrex::Real psi_inv = 1._rt/psi;
+                        psi_inv = 0._rt;
+                        if (psi > 0._rt) {
+                            psi_inv = 1._rt/psi;
+                        } else {
+                            is_valid = false;
+                        }
 
                         auto [dz_ux, dz_uy, dz_psi] = PlasmaMomentumPush(
                             ux, uy, psi_inv, ExmByp, EypBxp, Ezp, Bxp, Byp, Bzp,
-                            Aabssqp, AabssqDxp, AabssqDyp, clight_inv, q_mass_clight_ratio);
+                            Aabssqp, AabssqDxp, AabssqDyp, q_mass_clight_ratio);
 
                         const DualNumber ux_dual{ux, dz_ux};
                         const DualNumber uy_dual{uy, dz_uy};
@@ -159,33 +171,46 @@ AdvancePlasmaParticles (PlasmaParticleContainer& plasma, const Fields & fields,
 
                         auto [dz_ux_dual, dz_uy_dual, dz_psi_dual] = PlasmaMomentumPush(
                             ux_dual, uy_dual, psi_inv_dual, ExmByp, EypBxp, Ezp, Bxp, Byp, Bzp,
-                            Aabssqp, AabssqDxp, AabssqDyp, clight_inv, q_mass_clight_ratio);
+                            Aabssqp, AabssqDxp, AabssqDyp, q_mass_clight_ratio);
+
+                        const DualNumber gamma_psi = 0.5_rt*psi_inv_dual*psi_inv_dual*(
+                            1.0_rt + Aabssqp
+                            + ux_dual*ux_dual
+                            + uy_dual*uy_dual)
+                            + 0.5_rt;
 
                         ux += sdz*dz_ux + 0.5_rt*sdz*sdz*dz_ux_dual.epsilon;
                         uy += sdz*dz_uy + 0.5_rt*sdz*sdz*dz_uy_dual.epsilon;
                         psi += sdz*dz_psi + 0.5_rt*sdz*sdz*dz_psi_dual.epsilon;
 
+                        time_integral +=
+                            sdz * gamma_psi.value * clight_inv
+                            + 0.5_rt * sdz * sdz* gamma_psi.epsilon * clight_inv;
+                    }
+
+                    psi_inv = 0._rt;
+                    if (psi > 0._rt) {
+                        psi_inv = 1._rt/psi;
+                    } else {
+                        is_valid = false;
                     }
 
                     // full push in position
                     // from t to t+1
                     // using the momentum at t+1/2
-                    xp += dz*clight_inv*(ux * (1._rt/psi));
-                    yp += dz*clight_inv*(uy * (1._rt/psi));
+                    xp += dz*(ux * psi_inv);
+                    yp += dz*(uy * psi_inv);
 
                     if (enforceBC(ptd, ip, xp, yp, ux, uy, PlasmaIdx::w)) return;
                     ptd.pos(0, ip) = xp;
                     ptd.pos(1, ip) = yp;
 
-                    if (!temp_slice) {
-                        // update values of the last non temp slice
-                        // the next push always starts from these
-                        ptd.rdata(PlasmaIdx::ux_half_step)[ip] = ux;
-                        ptd.rdata(PlasmaIdx::uy_half_step)[ip] = uy;
-                        ptd.rdata(PlasmaIdx::psi_half_step)[ip] = psi;
-                        ptd.rdata(PlasmaIdx::x_prev)[ip] = xp;
-                        ptd.rdata(PlasmaIdx::y_prev)[ip] = yp;
-                    }
+                    const amrex::Real half_step_ux = ux;
+                    const amrex::Real half_step_uy = uy;
+                    const amrex::Real half_step_psi = psi;
+                    const amrex::Real half_step_time_integral = time_integral;
+                    const amrex::Real prev_step_x = xp;
+                    const amrex::Real prev_step_y = yp;
 
                     // half push in momentum
                     // from t+1/2 to t+1
@@ -193,11 +218,16 @@ AdvancePlasmaParticles (PlasmaParticleContainer& plasma, const Fields & fields,
                     // the result is used for current deposition etc. but not in the pusher
                     for (int isub=0; isub<(nsub/2); ++isub) {
 
-                        const amrex::Real psi_inv = 1._rt/psi;
+                        psi_inv = 0._rt;
+                        if (psi > 0._rt) {
+                            psi_inv = 1._rt/psi;
+                        } else {
+                            is_valid = false;
+                        }
 
                         auto [dz_ux, dz_uy, dz_psi] = PlasmaMomentumPush(
                             ux, uy, psi_inv, ExmByp, EypBxp, Ezp, Bxp, Byp, Bzp,
-                            Aabssqp, AabssqDxp, AabssqDyp, clight_inv, q_mass_clight_ratio);
+                            Aabssqp, AabssqDxp, AabssqDyp, q_mass_clight_ratio);
 
                         const DualNumber ux_dual{ux, dz_ux};
                         const DualNumber uy_dual{uy, dz_uy};
@@ -205,16 +235,56 @@ AdvancePlasmaParticles (PlasmaParticleContainer& plasma, const Fields & fields,
 
                         auto [dz_ux_dual, dz_uy_dual, dz_psi_dual] = PlasmaMomentumPush(
                             ux_dual, uy_dual, psi_inv_dual, ExmByp, EypBxp, Ezp, Bxp, Byp, Bzp,
-                            Aabssqp, AabssqDxp, AabssqDyp, clight_inv, q_mass_clight_ratio);
+                            Aabssqp, AabssqDxp, AabssqDyp, q_mass_clight_ratio);
 
                         ux += sdz*dz_ux + 0.5_rt*sdz*sdz*dz_ux_dual.epsilon;
                         uy += sdz*dz_uy + 0.5_rt*sdz*sdz*dz_uy_dual.epsilon;
                         psi += sdz*dz_psi + 0.5_rt*sdz*sdz*dz_psi_dual.epsilon;
-
                     }
-                    ptd.rdata(PlasmaIdx::ux)[ip] = ux;
-                    ptd.rdata(PlasmaIdx::uy)[ip] = uy;
-                    ptd.rdata(PlasmaIdx::psi)[ip] = psi;
+
+                    psi_inv = 0._rt;
+                    if (psi > 0._rt) {
+                        psi_inv = 1._rt/psi;
+                    } else {
+                        is_valid = false;
+                    }
+
+                    if (check_time) {
+                        amrex::Real gamma_psi = 0.5_rt*psi_inv*psi_inv*(
+                            1.0_rt + Aabssqp
+                            + ux*ux
+                            + uy*uy)
+                            + 0.5_rt;
+
+                        const amrex::Real time_in_slice = dzeta * gamma_psi * clight_inv;
+
+                        if (time_in_slice > dt) {
+                            is_valid = false;
+                        }
+                    }
+
+                    if (!temp_slice && is_valid) {
+                        // update values of the last non temp slice
+                        // the next push always starts from these
+                        ptd.rdata(PlasmaIdx::ux_half_step)[ip] = half_step_ux;
+                        ptd.rdata(PlasmaIdx::uy_half_step)[ip] = half_step_uy;
+                        ptd.rdata(PlasmaIdx::psi_half_step)[ip] = half_step_psi;
+                        ptd.rdata(PlasmaIdx::time_integral)[ip] = half_step_time_integral;
+                        ptd.rdata(PlasmaIdx::x_prev)[ip] = prev_step_x;
+                        ptd.rdata(PlasmaIdx::y_prev)[ip] = prev_step_y;
+                    }
+
+                    if (is_valid) {
+                        ptd.rdata(PlasmaIdx::ux)[ip] = ux;
+                        ptd.rdata(PlasmaIdx::uy)[ip] = uy;
+                        ptd.rdata(PlasmaIdx::psi)[ip] = psi;
+                    } else {
+                        if (ptd.id(ip) == 2) { // for testing remove this check
+                            ptd.id(ip) = 3;
+                        } else {
+                            ptd.id(ip).make_invalid();
+                        }
+                    }
 #else
                     amrex::Real ux = ptd.rdata(PlasmaIdx::ux_half_step)[ip];
                     amrex::Real uy = ptd.rdata(PlasmaIdx::uy_half_step)[ip];
@@ -223,10 +293,10 @@ AdvancePlasmaParticles (PlasmaParticleContainer& plasma, const Fields & fields,
 
                     auto [dz_ux, dz_uy, dz_psi] = PlasmaMomentumPush(
                         ux, uy, psi_inv, ExmByp, EypBxp, Ezp, Bxp, Byp, Bzp,
-                        Aabssqp, AabssqDxp, AabssqDyp, clight_inv, q_mass_clight_ratio);
+                        Aabssqp, AabssqDxp, AabssqDyp, q_mass_clight_ratio);
 
-                    ptd.rdata(PlasmaIdx::Fx1)[ip] = clight_inv*(ux * psi_inv);
-                    ptd.rdata(PlasmaIdx::Fy1)[ip] = clight_inv*(uy * psi_inv);
+                    ptd.rdata(PlasmaIdx::Fx1)[ip] = ux * psi_inv;
+                    ptd.rdata(PlasmaIdx::Fy1)[ip] = uy * psi_inv;
                     ptd.rdata(PlasmaIdx::Fux1)[ip] = dz_ux;
                     ptd.rdata(PlasmaIdx::Fuy1)[ip] = dz_uy;
                     ptd.rdata(PlasmaIdx::Fpsi1)[ip] = dz_psi;

@@ -26,17 +26,15 @@ struct BeamIdx
         x=0, y, z,  // position
         w,          // weight
         ux, uy, uz, // momentum
-        real_nattribs_in_buffer,
-        real_nattribs=real_nattribs_in_buffer
+        nsubcycles, // nsubcycles: by how many subcycles was this particle pushed already
+        real_nattribs,
+        real_nattribs_in_buffer = real_nattribs
     };
     enum {
-        // no extra components stored in MultiBuffer, besides 64bit idcpu
-        int_nattribs_in_buffer,
-        // nsubcycles: by how many subcycles was this particle pushed already
-        // nsubcycles is not stored or communicated in MultiBuffer
-        nsubcycles=int_nattribs_in_buffer,
         mr_level,
-        int_nattribs
+        int_nattribs,
+        // no extra components stored in MultiBuffer, besides 64bit idcpu
+        int_nattribs_in_buffer = mr_level
     };
 };
 
@@ -71,9 +69,7 @@ public:
     /** Constructor */
     explicit BeamParticleContainer (std::string name) :
         m_name(name)
-    {
-        ReadParameters();
-    }
+    {}
 
     /** Read parameters in the input file */
     void ReadParameters ();
@@ -123,6 +119,9 @@ public:
                                   const std::string species_name,
                                   const bool species_specified);
 #endif
+
+    /** Initialize a beam from a list in the input script */
+    void InitBeamFromList3D ();
 
     /** Compute reduced beam diagnostics of current slice, store in member variable
      * \param[in] islice current slice, on which diags are computed.
@@ -192,10 +191,6 @@ public:
         return m_total_num_particles;
     }
 
-    void updateSize (int n) {
-        m_total_num_particles = n;
-    }
-
     int numRealComponents () const {
         return BeamIdx::real_nattribs + (m_do_spin_tracking ? 3 : 0);
     }
@@ -203,11 +198,11 @@ public:
 
     bool communicateIdCpuComponent () const { return true; }
     bool communicateRealComponent (int rcomp) const {
-        // communicate all compile-time and runtime real components
+        // otherwise communicate all compile-time and runtime real components
         return rcomp < numRealComponents();
     }
     bool communicateIntComponent (int icomp) const {
-        // don't communicate nsubcycles or mr_level
+        // don't communicate mr_level
         return icomp < BeamIdx::int_nattribs_in_buffer;
     }
 
@@ -244,18 +239,20 @@ public:
     amrex::RealVect m_initial_spin = {1, 0, 0,};
     /** The anomalous magnetic moment */
     amrex::Real m_spin_anom = 0.00115965218128;
+    /** ratio of beam particles that are written to the openPMD output */
+    int m_output_ratio = 1;
 private:
     std::string m_name; /**< name of the species */
     /** injection type, fixed_width or fixed_ppc */
     std::string m_injection_type;
     uint64_t m_id64 = 1; /**< 64 bit ID to initialize many particles without overflowing */
     /** Min longitudinal particle position of the beam */
-    amrex::Real m_zmin = -std::numeric_limits<amrex::Real>::infinity();
+    amrex::Real m_zmin = -std::numeric_limits<amrex::Real>::max();
     /** Max longitudinal particle position of the beam */
-    amrex::Real m_zmax = std::numeric_limits<amrex::Real>::infinity();
-    amrex::Real m_radius {std::numeric_limits<amrex::Real>::infinity()}; /**< Radius of the beam */
+    amrex::Real m_zmax = std::numeric_limits<amrex::Real>::max();
+    amrex::Real m_radius {std::numeric_limits<amrex::Real>::max()}; /**< Radius of the beam */
     /** radius of the beam insitu diagnostics */
-    amrex::Real m_insitu_radius {std::numeric_limits<amrex::Real>::infinity()};
+    amrex::Real m_insitu_radius {std::numeric_limits<amrex::Real>::max()};
     GetInitialMomentum m_get_momentum {}; /**< momentum profile of the beam */
     /** After how many slices the particles are reordered. 0: off */
     int m_reorder_period = 0;
@@ -263,7 +260,7 @@ private:
     amrex::IntVect m_reorder_idx_type = {0, 0, 0};
 
     // fixed_ppc:
-private:
+
     amrex::IntVect m_ppc {1, 1, 1}; /**< Number of particles per cell in each direction */
     amrex::RealVect m_position_mean {0., 0., 0.}; /**< mean position of the beam */
     amrex::Real m_min_density {0.}; /**< minimum density at which beam particles are generated */
@@ -322,6 +319,10 @@ private:
     int m_num_iteration {0}; /**< the iteration of the openPMD beam */
     std::string m_species_name; /**< the name of the particle species in the beam file */
 
+    // from list
+
+    amrex::Long m_num_particles_list; /**< Number of particles in input list */
+
     // insitu:
 
     int m_nslices; /**< number of z slices of the domain */
@@ -338,7 +339,7 @@ private:
     /** Sum of all per-slice int beam properties */
     amrex::Vector<int> m_insitu_sum_idata;
     /** Prefix/path for the output files */
-    std::string m_insitu_file_prefix = "diags/insitu";
+    std::string m_insitu_file_prefix = "";
 
     // spin insitu:
 
